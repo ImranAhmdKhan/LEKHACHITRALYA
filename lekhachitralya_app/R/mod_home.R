@@ -46,7 +46,8 @@ homeUI <- function() {
                 tags$li(strong("Network data"), " \u2013 herb, molecule, target"),
                 tags$li(strong("PPI data"),     " \u2013 node1, node2, optional score"),
                 tags$li(strong("Gene-set data"), " \u2013 gene, dataset (for Venn/UpSet)"),
-                tags$li(strong("Enrichment data"), " \u2013 Description, Count, pvalue, GeneRatio, BgRatio, geneID")
+                tags$li(strong("Enrichment data"), " \u2013 Description, Count, pvalue, GeneRatio, BgRatio, geneID"),
+                tags$li(strong("Any tabular data"), " \u2013 use \u2728 General Plots for 82 chart types")
               )
             ),
             column(6,
@@ -73,7 +74,20 @@ homeUI <- function() {
                   tags$tr(tags$td("Class count"),
                           tags$td("Which protein classes targeted"),   tags$td("\U0001f52c Classification"))
                 )
-              )
+              ),
+              hr(),
+              h4("\u2728 New: General Plots & Plot Gallery"),
+              p("LekhaChitralya now includes two additional tabs:"),
+              tags$ul(
+                tags$li(strong("\U0001f4ca General Plots"), " \u2013 82 chart types for any tabular data,",
+                        " organised into 10 groups (Bar, Histogram, Box/Violin, Scatter,",
+                        " Line/Area, Heatmap, Part-to-Whole, Ranking, Multivariate, Statistical)."),
+                tags$li(strong("\U0001f4ca Plot Gallery"), " \u2013 A searchable catalogue of ",
+                        strong("505+ named chart types"), " across 20 categories,",
+                        " showing which are implemented and where to find them.")
+              ),
+              p(em("Tip: open the Plot Gallery tab to browse and discover the right chart",
+                   " for your data, then use the matching tab to generate it."))
             )
           )
       )
