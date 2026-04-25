@@ -31,9 +31,17 @@ safe_install <- function(pkg) {
 }
 for (p in c("TCMNP", "ggraph", "igraph", "ggalluvial")) safe_install(p)
 
-HAS_FMSB   <- requireNamespace("fmsb",    quietly = TRUE)
-HAS_GGDEND <- requireNamespace("ggdendro", quietly = TRUE)
-HAS_SCALES <- requireNamespace("scales",  quietly = TRUE)
+# Optional packages used by the General Purpose Plots module and others;
+# installed automatically when available.
+for (p in c("ggridges", "ggrepel", "treemapify", "hexbin",
+            "RColorBrewer", "stringr")) safe_install(p)
+
+HAS_FMSB      <- requireNamespace("fmsb",       quietly = TRUE)
+HAS_GGDEND    <- requireNamespace("ggdendro",   quietly = TRUE)
+HAS_SCALES    <- requireNamespace("scales",     quietly = TRUE)
+HAS_GGRIDGES  <- requireNamespace("ggridges",   quietly = TRUE)
+HAS_GGREPEL   <- requireNamespace("ggrepel",    quietly = TRUE)
+HAS_TREEMAP   <- requireNamespace("treemapify", quietly = TRUE)
 if (HAS_SCALES) library(scales)
 
 # ── App-wide constants ───────────────────────────────────────

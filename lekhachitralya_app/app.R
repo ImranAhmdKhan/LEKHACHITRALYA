@@ -23,7 +23,8 @@
 #    R/mod_degree.R        – Degree Plots module    (network data, 10 plots)
 #    R/mod_venn.R          – Venn / UpSet module    (gene-set data, 10 plots)
 #    R/mod_enrich.R        – Enrichment module      (enrichment data, 30+ plots)
-#    R/mod_export.R        – Plot Export module
+#    R/mod_gallery.R          – Plot Gallery / Classification (505+ plot types)
+#    R/mod_general.R          – General Purpose Plots (86 implemented types)
 #    www/custom.css        – CSS overrides
 #
 #  All shared reactive state (datasets, mappings, plots, global
@@ -90,6 +91,10 @@ ui <- dashboardPage(
                tabName = "venn",    icon = icon("circle-half-stroke")),
       menuItem("\U0001f9ea Enrichment",
                tabName = "enrich",  icon = icon("dna")),
+      menuItem("\U0001f4ca General Plots",
+               tabName = "general", icon = icon("chart-line")),
+      menuItem("\U0001f4ca Plot Gallery",
+               tabName = "gallery", icon = icon("images")),
       menuItem("\U0001f4be Export",
                tabName = "export",  icon = icon("download"))
     )
@@ -123,6 +128,8 @@ ui <- dashboardPage(
       degreeUI(),
       vennUI(),
       enrichUI(),
+      generalUI(),
+      galleryUI(),
       exportUI()
     )
   )
@@ -154,6 +161,8 @@ server <- function(input, output, session) {
   degreeServer(input, output, session, rv)
   vennServer(  input, output, session, rv)
   enrichServer(input, output, session, rv)
+  generalServer(input, output, session, rv)
+  galleryServer(input, output, session, rv)
   exportServer(input, output, session, rv)
 }
 
