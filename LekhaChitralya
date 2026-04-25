@@ -1,0 +1,3166 @@
+# ============================================================
+#  TCMNP Publication Plot Generator  –  Shiny GUI  (v4)
+#  Best-in-class plots for long-format docking data
+#  Columns: Title | PDB ID | PDB CLASSIFICATION |
+#            docking score | ROMANID | FRACTIONS
+# ============================================================
+
+library(shiny)
+library(shinydashboard)
+library(shinyjs)
+library(shinycssloaders)
+library(readxl)
+library(DT)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(forcats)
+library(tibble)
+
+safe_install <- function(pkg) {
+  if (!requireNamespace(pkg, quietly = TRUE)) install.packages(pkg)
+  library(pkg, character.only = TRUE)
+}
+for (p in c("TCMNP","ggraph","igraph","ggalluvial")) safe_install(p)
+
+HAS_FMSB   <- requireNamespace("fmsb",    quietly=TRUE)
+HAS_GGDEND <- requireNamespace("ggdendro",quietly=TRUE)
+HAS_SCALES <- requireNamespace("scales",  quietly=TRUE)
+if (HAS_SCALES) library(scales)
+
+PALETTES <- c("Spectral","RdYlBu","RdYlGn","Set1","Set2",
+              "Paired","Blues","Greens","Purples","Oranges",
+              "YlOrRd","PiYG","PRGn","BrBG")
+
+GG_THEMES <- c("theme_classic","theme_bw","theme_minimal",
+               "theme_light","theme_dark","theme_void",
+               "theme_gray","theme_linedraw")
+
+FONT_FAMILIES <- c("sans","serif","mono","Helvetica","Times","Courier")
+
+`%||%` <- function(a, b) if (!is.null(a) && nzchar(a)) a else b
+
+auto_detect_cols <- function(df) {
+  nms  <- tolower(names(df))
+  orig <- names(df)
+  find <- function(patterns)
+    orig[which(nms %in% patterns |
+                 grepl(paste(patterns, collapse="|"), nms))[1]]
+  list(
+    molecule    = find(c("title","molecule","compound","cid","mol_id")),
+    target      = find(c("pdb id","pdb_id","pdbid","target","protein","gene")),
+    score       = find(c("docking score","docking_score","score","affinity","binding")),
+    description = find(c("pdb classification","pdb_classification","classification",
+                         "description","category","class","type")),
+    fraction    = find(c("fractions","fraction","group","dataset","sample")),
+    romanid     = find(c("romanid","roman_id","roman","id","compound_id"))
+  )
+}
+
+pivot_to_matrix <- function(df, row_col, col_col, val_col) {
+  wide <- df %>%
+    dplyr::select(all_of(c(row_col, col_col, val_col))) %>%
+    dplyr::group_by(across(all_of(c(row_col, col_col)))) %>%
+    dplyr::summarise(score=mean(.data[[val_col]], na.rm=TRUE), .groups="drop") %>%
+    tidyr::pivot_wider(names_from=all_of(col_col),
+                       values_from=score, values_fill=0)
+  mat           <- as.matrix(wide[,-1,drop=FALSE])
+  rownames(mat) <- wide[[row_col]]
+  storage.mode(mat) <- "double"
+  mat
+}
+
+wrap_text_vec <- function(x, width=28) {
+  vapply(as.character(x), function(s) {
+    if (is.na(s) || !nzchar(s)) return("")
+    paste(strwrap(s, width=width), collapse="\n")
+  }, character(1))
+}
+
+parse_ratio_side <- function(x, side=1L) {
+  x <- as.character(x)
+  vapply(x, function(v) {
+    if (is.na(v) || !nzchar(v)) return(NA_real_)
+    if (grepl("/", v, fixed=TRUE)) {
+      sp <- strsplit(v, "/", fixed=TRUE)[[1]]
+      if (length(sp) >= side) return(suppressWarnings(as.numeric(sp[[side]])))
+    }
+    suppressWarnings(as.numeric(v))
+  }, numeric(1))
+}
+
+explode_links <- function(labels, values, sep="/") {
+  parts <- Map(function(lbl, val) {
+    vals <- trimws(unlist(strsplit(as.character(val), sep, fixed=TRUE)))
+    vals <- vals[nzchar(vals)]
+    if (!length(vals)) return(NULL)
+    data.frame(term=as.character(lbl), gene=vals, stringsAsFactors=FALSE)
+  }, labels, values)
+  dplyr::bind_rows(parts) %>% dplyr::distinct()
+}
+
+normalise_enrich_df <- function(df) {
+  df <- as.data.frame(df)
+  if (!nrow(df)) return(df)
+
+  if (!"Description" %in% names(df))
+    df$Description <- paste("Term", seq_len(nrow(df)))
+  if (!"ID" %in% names(df))
+    df$ID <- paste0("T", seq_len(nrow(df)))
+  if (!"Count" %in% names(df) && "GeneRatio" %in% names(df))
+    df$Count <- parse_ratio_side(df$GeneRatio, 1)
+  if (!"pvalue" %in% names(df) && "p.adjust" %in% names(df))
+    df$pvalue <- df$p.adjust
+  if (!"p.adjust" %in% names(df) && "pvalue" %in% names(df))
+    df$p.adjust <- df$pvalue
+  if (!"GeneRatio" %in% names(df) && "Count" %in% names(df))
+    df$GeneRatio <- paste(df$Count, pmax(df$Count, 1), sep="/")
+  if (!"BgRatio" %in% names(df) && "Count" %in% names(df)) {
+    bg_total <- max(suppressWarnings(as.numeric(df$Count)), na.rm=TRUE)
+    if (!is.finite(bg_total)) bg_total <- nrow(df) + 10
+    bg_total <- max(bg_total, max(suppressWarnings(as.numeric(df$Count)), na.rm=TRUE) + 1, 10)
+    df$BgRatio <- paste(df$Count, bg_total, sep="/")
+  }
+  if (!"geneID" %in% names(df))
+    df$geneID <- gsub("\\s+", "_", as.character(df$Description))
+  if (!"ONTOLOGY" %in% names(df))
+    df$ONTOLOGY <- "GO"
+
+  df$Count <- suppressWarnings(as.numeric(df$Count))
+  df$pvalue <- suppressWarnings(as.numeric(df$pvalue))
+  df$p.adjust <- suppressWarnings(as.numeric(df$p.adjust))
+  df$gene_ratio_num <- parse_ratio_side(df$GeneRatio, 1)
+  df$gene_ratio_den <- parse_ratio_side(df$GeneRatio, 2)
+  df$bg_ratio_num   <- parse_ratio_side(df$BgRatio, 1)
+  df$bg_ratio_den   <- parse_ratio_side(df$BgRatio, 2)
+  df$RichFactor <- ifelse(df$bg_ratio_num > 0, df$Count / df$bg_ratio_num, NA_real_)
+  df$neglog10p  <- -log10(pmax(df$pvalue, .Machine$double.eps))
+  df$Description_wrapped <- wrap_text_vec(df$Description, width=28)
+  df <- df[!is.na(df$Count) & !is.na(df$pvalue), , drop=FALSE]
+  rownames(df) <- NULL
+  df
+}
+
+make_degree_df <- function(df) {
+  deg <- df %>% dplyr::mutate(value=1)
+  herb_degree <- aggregate(deg$value, by=list(deg$herb), length) %>%
+    as.data.frame() %>% dplyr::mutate(type="herb")
+  molecule_degree <- aggregate(deg$value, by=list(deg$molecule), length) %>%
+    as.data.frame() %>% dplyr::mutate(type="molecule")
+  target_degree <- aggregate(deg$value, by=list(deg$target), length) %>%
+    as.data.frame() %>% dplyr::mutate(type="target")
+  deg2 <- rbind(herb_degree, molecule_degree, target_degree)
+  colnames(deg2) <- c("id","degree","type")
+  deg2 %>% dplyr::select(id, type, degree) %>% as.data.frame()
+}
+
+pairwise_overlap_df <- function(df, item_col="gene", set_col="dataset") {
+  sets <- sort(unique(as.character(df[[set_col]])))
+  if (!length(sets)) return(data.frame(set1=character(), set2=character(), overlap=numeric()))
+  set_items <- stats::setNames(lapply(sets, function(s) {
+    unique(as.character(df[df[[set_col]] == s, item_col]))
+  }), sets)
+  grid <- expand.grid(set1=sets, set2=sets, stringsAsFactors=FALSE)
+  grid$overlap <- vapply(seq_len(nrow(grid)), function(i) {
+    length(intersect(set_items[[grid$set1[i]]], set_items[[grid$set2[i]]]))
+  }, numeric(1))
+  grid
+}
+
+dataset_picker <- function(id) uiOutput(id)
+
+label_theme_box <- function(ns_prefix, show_xy=TRUE, show_leg=TRUE) {
+  box(width=12, collapsible=TRUE, collapsed=TRUE,
+      title="✏️ Labels & Theme", status="warning", solidHeader=TRUE,
+      fluidRow(
+        column(4,
+               textInput(paste0(ns_prefix,"_title"),    "Plot title",       ""),
+               textInput(paste0(ns_prefix,"_subtitle"),  "Subtitle",         ""),
+               textInput(paste0(ns_prefix,"_caption"),   "Caption / source", "")
+        ),
+        column(4,
+               if (show_xy) tagList(
+                 textInput(paste0(ns_prefix,"_xlab"), "X-axis label", ""),
+                 textInput(paste0(ns_prefix,"_ylab"), "Y-axis label", "")
+               ),
+               if (show_leg)
+                 textInput(paste0(ns_prefix,"_leglab"), "Legend title", "")
+        ),
+        column(4,
+               selectInput(paste0(ns_prefix,"_theme"), "ggplot2 theme",
+                           GG_THEMES, selected="theme_classic"),
+               selectInput(paste0(ns_prefix,"_font"),  "Font family", FONT_FAMILIES),
+               numericInput(paste0(ns_prefix,"_base_sz"),  "Base font size", 12, 6, 28),
+               numericInput(paste0(ns_prefix,"_title_sz"), "Title size",     14, 6, 32)
+        )
+      )
+  )
+}
+
+apply_labels <- function(p, ns_prefix, input, show_xy=TRUE, show_leg=TRUE) {
+  if (!inherits(p,"gg")) return(p)
+  theme_fn <- tryCatch(
+    get(input[[paste0(ns_prefix,"_theme")]] %||% "theme_classic"),
+    error=function(e) theme_classic)
+  font_fam <- input[[paste0(ns_prefix,"_font")]]     %||% "sans"
+  base_sz  <- input[[paste0(ns_prefix,"_base_sz")]]  %||% 12
+  title_sz <- input[[paste0(ns_prefix,"_title_sz")]] %||% 14
+  p <- p + theme_fn(base_size=base_sz, base_family=font_fam) +
+    theme(plot.title    = element_text(size=title_sz, face="bold"),
+          plot.subtitle = element_text(size=base_sz-1),
+          plot.caption  = element_text(size=base_sz-2, colour="#666"),
+          legend.title  = element_text(size=base_sz-1))
+  lbl <- list()
+  v   <- function(s) input[[paste0(ns_prefix,"_",s)]] %||% NULL
+  if (!is.null(v("title")))    lbl$title    <- v("title")
+  if (!is.null(v("subtitle"))) lbl$subtitle <- v("subtitle")
+  if (!is.null(v("caption")))  lbl$caption  <- v("caption")
+  if (show_xy) {
+    if (!is.null(v("xlab"))) lbl$x <- v("xlab")
+    if (!is.null(v("ylab"))) lbl$y <- v("ylab")
+  }
+  if (show_leg && !is.null(v("leglab")))
+    lbl$fill <- lbl$colour <- v("leglab")
+  if (length(lbl)) p <- p + do.call(labs, lbl)
+  p
+}
+
+# ─────────────────────────────────────────���───────────────────
+#  UI
+# ─────────────────────────────────────────────────────────────
+ui <- dashboardPage(
+  skin = "green",
+  dashboardHeader(title="TCMNP Plot Generator v4"),
+
+  dashboardSidebar(
+    useShinyjs(),
+    sidebarMenu(id="tabs",
+                menuItem("🏠 Home",                tabName="home",    icon=icon("home")),
+                menuItem("📂 Data Upload",         tabName="upload",  icon=icon("upload")),
+                menuItem("🗺 Column Mapping",      tabName="colmap",  icon=icon("sliders")),
+                menuItem("🎨 Global Theme",        tabName="gtheme",  icon=icon("palette")),
+                menuItem("🏆 Best Plots",          tabName="best",    icon=icon("star")),
+                menuItem("⚗️ Docking Heatmap",     tabName="dock",    icon=icon("flask")),
+                menuItem("📊 Score Explorer",      tabName="scoreex", icon=icon("chart-bar")),
+                menuItem("🔬 Classification Plot", tabName="classif", icon=icon("microscope")),
+                menuItem("🌐 Network",             tabName="tcmnet",  icon=icon("project-diagram")),
+                menuItem("🔗 PPI Network",         tabName="ppi",     icon=icon("circle-nodes")),
+                menuItem("🌊 Sankey / Alluvial",   tabName="sankey",  icon=icon("water")),
+                menuItem("📊 Degree Plot",         tabName="degree",  icon=icon("chart-bar")),
+                menuItem("🧅 Venn / UpSet",        tabName="venn",    icon=icon("circle")),
+                menuItem("📈 Enrichment Plots",    tabName="enrich",  icon=icon("dna")),
+                menuItem("💾 Export",              tabName="export",  icon=icon("download"))
+    )
+  ),
+
+  dashboardBody(
+    tags$head(tags$style(HTML("
+      .content-wrapper  { background:#f4f6f9; }
+      .box              { border-top:3px solid #00a65a; }
+      .box.box-warning  { border-top:3px solid #f39c12; }
+      .box.box-info     { border-top:3px solid #00c0ef; }
+      .box.box-danger   { border-top:3px solid #dd4b39; }
+      .plot-caption     { color:#666; font-size:12px; margin-top:4px; }
+      .dataset-badge    { background:#00a65a; color:#fff; border-radius:4px;
+                          padding:2px 8px; font-size:11px; }
+      .map-group        { background:#fff; border:1px solid #ddd; border-radius:6px;
+                          padding:10px 14px; margin-bottom:12px; }
+      .map-group h5     { margin-top:0; color:#00a65a; font-weight:700; }
+      .override-group   { background:#fffbf0; border:1px solid #f0d080;
+                          border-radius:6px; padding:8px 12px; margin-bottom:10px; }
+      .override-group h6{ margin:0 0 6px 0; color:#b8860b; font-weight:700; }
+      .filter-group     { background:#f0fff4; border:1px solid #b2dfdb;
+                          border-radius:6px; padding:8px 12px; margin-bottom:10px; }
+      .filter-group h6  { margin:0 0 6px 0; color:#00695c; font-weight:700; }
+      .auto-badge       { background:#3c8dbc; color:#fff; border-radius:3px;
+                          padding:1px 6px; font-size:10px; margin-left:4px; }
+      .best-badge       { background:#f39c12; color:#fff; border-radius:3px;
+                          padding:2px 8px; font-size:11px; font-weight:700; }
+    "))),
+
+    tabItems(
+
+      # ── HOME ──────────────────────────────────────────────
+      tabItem("home",
+              fluidRow(
+                box(width=12, status="success", solidHeader=TRUE,
+                    title="TCMNP Plot Generator v4 - Docking Data Specialist",
+                    fluidRow(
+                      column(6,
+                             h4("📋 Your data structure:"),
+                             tags$table(class="table table-condensed table-bordered",
+                                        tags$thead(tags$tr(tags$th("Column"),tags$th("Role"),tags$th("Example"))),
+                                        tags$tbody(
+                                          tags$tr(tags$td("Title"),              tags$td("Molecule CID"),      tags$td("534589")),
+                                          tags$tr(tags$td("PDB ID"),             tags$td("Target protein"),    tags$td("4HT2")),
+                                          tags$tr(tags$td("PDB CLASSIFICATION"), tags$td("Protein category"),  tags$td("LYASE/LYASE INHIBITOR")),
+                                          tags$tr(tags$td("docking score"),      tags$td("Affinity kcal/mol"), tags$td("-8.868")),
+                                          tags$tr(tags$td("ROMANID"),            tags$td("Compound group"),    tags$td("XXVIII")),
+                                          tags$tr(tags$td("FRACTIONS"),          tags$td("Sample source"),     tags$td("FRACONE / EXTERNAL"))
+                                        )
+                             ),
+                             h4("🚀 Quick-start"),
+                             tags$ol(
+                               tags$li("📂 Upload .xlsx -> Load ALL Sheets"),
+                               tags$li("🤖 Column Mapping -> Auto-detect & Apply"),
+                               tags$li(strong("🏆 Best Plots"), " -> choose plot type -> Draw"),
+                               tags$li("💾 Export -> PNG 300 DPI for publication")
+                             )
+                      ),
+                      column(6,
+                             h4("🏆 Recommended plots for your data:"),
+                             tags$table(class="table table-condensed table-bordered",
+                                        tags$thead(tags$tr(tags$th("Plot"),tags$th("What it shows"),tags$th("Tab"))),
+                                        tags$tbody(
+                                          tags$tr(tags$td(span(class="best-badge","★")," Lollipop"),
+                                                  tags$td("Top binding molecules ranked"), tags$td("🏆 Best Plots")),
+                                          tags$tr(tags$td(span(class="best-badge","★")," Violin"),
+                                                  tags$td("Score spread per FRACTION"),   tags$td("🏆 Best Plots")),
+                                          tags$tr(tags$td(span(class="best-badge","★")," Bubble"),
+                                                  tags$td("Class x Fraction matrix"),     tags$td("🏆 Best Plots")),
+                                          tags$tr(tags$td(span(class="best-badge","★")," Hit Rate"),
+                                                  tags$td("% strong binders per mol"),    tags$td("🏆 Best Plots")),
+                                          tags$tr(tags$td(span(class="best-badge","★")," Heatmap"),
+                                                  tags$td("Molecule x Target matrix"),    tags$td("⚗️ Docking")),
+                                          tags$tr(tags$td(span(class="best-badge","★")," Radar"),
+                                                  tags$td("Mol across protein classes"),  tags$td("🏆 Best Plots")),
+                                          tags$tr(tags$td("Score dist."),
+                                                  tags$td("Overall score histogram"),     tags$td("📊 Score Explorer")),
+                                          tags$tr(tags$td("Class count"),
+                                                  tags$td("Which protein classes targeted"),tags$td("🔬 Classification"))
+                                        )
+                             )
+                      )
+                    )
+                )
+              )
+      ),
+
+      # ── UPLOAD ────────────────────────────────────────────
+      tabItem("upload",
+              fluidRow(
+                box(width=5, title="Upload File", status="primary", solidHeader=TRUE,
+                    fileInput("file_main","Choose .xlsx / .xls / .csv",
+                              accept=c(".xlsx",".xls",".csv")),
+                    checkboxInput("has_header","First row is header",TRUE),
+                    hr(),
+                    h5("Option A - all sheets"),
+                    actionButton("load_all","Load ALL Sheets",
+                                 icon=icon("layer-group"),class="btn-success btn-block"),
+                    hr(),
+                    h5("Option B - one sheet"),
+                    uiOutput("sheet_selector_single"),
+                    actionButton("load_one","Load Selected Sheet",
+                                 icon=icon("table"),class="btn-primary btn-block"),
+                    hr(),
+                    h5("Option C - paste tab-separated data"),
+                    textAreaInput("paste_data","Paste here","",rows=4),
+                    textInput("paste_name","Dataset name","pasted_data"),
+                    actionButton("load_paste","Import Pasted Data",
+                                 icon=icon("paste"),class="btn-warning btn-block")
+                ),
+                box(width=7, title="Loaded Datasets", status="success", solidHeader=TRUE,
+                    uiOutput("loaded_datasets_summary"),
+                    hr(),
+                    h5("Auto-detected column roles (first dataset):"),
+                    uiOutput("auto_detect_summary"))
+              ),
+              fluidRow(
+                box(width=12, title="Data Preview", status="success", solidHeader=TRUE,
+                    uiOutput("preview_sheet_picker"),
+                    DTOutput("preview_table"))
+              )
+      ),
+
+      # ── COLUMN MAPPING ────────────────────────────────────
+      tabItem("colmap",
+              fluidRow(
+                box(width=4, title="Select Sheet to Map", status="primary", solidHeader=TRUE,
+                    uiOutput("colmap_sheet_picker"),
+                    p(style="color:#888;font-size:12px;","Detected columns:"),
+                    verbatimTextOutput("colmap_cols_preview"),
+                    hr(),
+                    actionButton("apply_mapping","Apply Mapping",
+                                 class="btn-success btn-lg",width="100%"),
+                    br(),br(),
+                    actionButton("auto_map","Auto-detect & Apply",
+                                 class="btn-info btn-lg",width="100%"),
+                    br(),
+                    p(style="color:#555;font-size:12px;",
+                      "Auto-detect uses column name patterns to assign roles.")
+                ),
+                box(width=8, title="Column Role Assignment", status="success", solidHeader=TRUE,
+                    div(class="map-group",
+                        h5("Docking / Score / Classification / Best Plots"),
+                        fluidRow(
+                          column(4, uiOutput("map_molecule_dock")),
+                          column(4, uiOutput("map_target_dock")),
+                          column(4, uiOutput("map_score_dock"))
+                        ),
+                        fluidRow(
+                          column(4, uiOutput("map_classification")),
+                          column(4, uiOutput("map_fraction")),
+                          column(4, uiOutput("map_romanid"))
+                        )
+                    ),
+                    div(class="map-group",
+                        h5("Network / Sankey / Degree"),
+                        fluidRow(
+                          column(4, uiOutput("map_herb")),
+                          column(4, uiOutput("map_molecule")),
+                          column(4, uiOutput("map_target"))
+                        ),
+                        fluidRow(column(4, uiOutput("map_description")))
+                    ),
+                    div(class="map-group",
+                        h5("PPI"),
+                        fluidRow(
+                          column(4, uiOutput("map_node1")),
+                          column(4, uiOutput("map_node2")),
+                          column(4, uiOutput("map_score"))
+                        )
+                    ),
+                    div(class="map-group",
+                        h5("Venn"),
+                        fluidRow(
+                          column(4, uiOutput("map_gene")),
+                          column(4, uiOutput("map_dataset_col"))
+                        )
+                    ),
+                    div(class="map-group",
+                        h5("Enrichment"),
+                        fluidRow(
+                          column(4, uiOutput("map_enrich_desc")),
+                          column(4, uiOutput("map_enrich_count")),
+                          column(4, uiOutput("map_enrich_pvalue"))
+                        ),
+                        fluidRow(
+                          column(4, uiOutput("map_enrich_generatio")),
+                          column(4, uiOutput("map_enrich_bgratio")),
+                          column(4, uiOutput("map_enrich_geneid"))
+                        )
+                    )
+                )
+              )
+      ),
+
+      # ── GLOBAL THEME ──────────────────────────────────────
+      tabItem("gtheme",
+              fluidRow(
+                box(width=6, title="Global Defaults", status="warning", solidHeader=TRUE,
+                    selectInput("g_theme","Default theme",GG_THEMES,"theme_classic"),
+                    selectInput("g_font","Font family",FONT_FAMILIES),
+                    numericInput("g_base_sz","Base font size",12,6,28),
+                    numericInput("g_title_sz","Title font size",14,6,32),
+                    hr(),
+                    textInput("g_xlab","Default X label",""),
+                    textInput("g_ylab","Default Y label",""),
+                    textInput("g_leglab","Default legend title",""),
+                    hr(),
+                    actionButton("save_gtheme","Save Global Defaults",
+                                 class="btn-success btn-lg",width="100%")
+                ),
+                box(width=6, title="Colour Defaults", status="warning", solidHeader=TRUE,
+                    selectInput("g_palette","Default colour palette",PALETTES,"Spectral"),
+                    sliderInput("g_alpha","Default alpha",0.2,1,0.9,step=0.05),
+                    numericInput("g_pt_sz","Default point size",3,0.5,10,step=0.5),
+                    numericInput("g_node_sz","Default node size",5,1,20)
+                )
+              )
+      ),
+
+      # ── BEST PLOTS ────────────────────────────────────────
+      tabItem("best",
+              fluidRow(
+                box(width=3, title="Parameters", status="danger", solidHeader=TRUE,
+                    dataset_picker("ds_best"),
+                    hr(),
+                    div(class="override-group",
+                        tags$h6("Column roles"),
+                        uiOutput("best_col_molecule"),
+                        uiOutput("best_col_target"),
+                        uiOutput("best_col_score"),
+                        uiOutput("best_col_fraction"),
+                        uiOutput("best_col_classification"),
+                        uiOutput("best_col_romanid")
+                    ),
+                    hr(),
+                     div(class="filter-group",
+                         tags$h6("Filters"),
+                         uiOutput("best_filter_fraction"),
+                         # *** FIXED: ASCII minus signs ***
+                         sliderInput("best_score_thresh",
+                                     "Score threshold (active if score <= x)",
+                                     min=-15, max=0, value=-7, step=0.5),
+                         numericInput("best_top_n","Top N molecules",20,5,100),
+                         sliderInput("best_alpha","Layer alpha",0.2,1,0.85,step=0.05),
+                         numericInput("best_wrap","Label wrap width",24,10,60)
+                     ),
+                     hr(),
+                     radioButtons("best_type","Plot type",
+                                  c("Lollipop - top hits"            = "lollipop",
+                                    "Violin - score by fraction"      = "violin",
+                                    "Bubble - class x fraction"       = "bubble",
+                                    "Hit-rate bar - % active"         = "hitrate",
+                                    "Radar - molecule profile"        = "radar",
+                                    "Heatmap (clustered)"             = "heatmap",
+                                    "ROMANID comparison"              = "romanid",
+                                    "Boxplot - score per class"       = "classbox",
+                                    "Dumbbell - best vs mean"         = "dumbbell",
+                                    "Target tile - molecule x target" = "targettile",
+                                    "Radial bar - top molecules"      = "radialbar",
+                                    "Slope - best vs median"          = "slope",
+                                    "Fraction active stack"           = "fracstack",
+                                    "Target lollipop"                 = "targetlollipop",
+                                    "Target count bar"                = "targetcount",
+                                    "Density by class"                = "densityclass",
+                                    "ECDF by fraction"                = "ecdf",
+                                    "Mean vs best scatter"            = "meanscatter"),
+                                  selected="lollipop"),
+                    conditionalPanel("input.best_type == 'radar'",
+                                     uiOutput("best_radar_mol_picker")
+                    ),
+                    selectInput("best_palette","Colour palette",PALETTES,"Spectral"),
+                    numericInput("best_base_sz","Base font size",12,6,22),
+                    actionButton("draw_best","Draw Best Plot",
+                                 class="btn-danger btn-lg",width="100%")
+                ),
+                box(width=9, title="Publication-Ready Plot",
+                    status="danger", solidHeader=TRUE,
+                    label_theme_box("best"),
+                    withSpinner(plotOutput("plot_best", height="600px"), type=6),
+                    hr(),
+                    uiOutput("best_stats_ui"))
+              )
+      ),
+
+      # ── DOCKING HEATMAP ───────────────────────────────────
+      tabItem("dock",
+              fluidRow(
+                box(width=3, title="Parameters", status="primary", solidHeader=TRUE,
+                    dataset_picker("ds_dock"),
+                    hr(),
+                    div(class="override-group",
+                        tags$h6("Column roles"),
+                        uiOutput("dock_col_molecule"),
+                        uiOutput("dock_col_target"),
+                        uiOutput("dock_col_score")
+                    ),
+                    hr(),
+                    div(class="filter-group",
+                        tags$h6("Filters"),
+                        uiOutput("dock_filter_fraction"),
+                        sliderInput("dock_score_thresh","Min |score| threshold",
+                                    0,15,0,step=0.5),
+                        numericInput("dock_top_n","Top N molecules",20,5,200),
+                        numericInput("dock_bins","Bins / contours",12,5,50)
+                    ),
+                    hr(),
+                    radioButtons("dock_type","Plot family",
+                                 c("TCMNP heatmap"="heatmap",
+                                   "Bubble matrix"="bubble",
+                                   "Strip heatmap"="strip",
+                                   "Contour score map"="contour",
+                                   "Target summary bar"="targetbar",
+                                   "Target boxplot"="targetbox",
+                                   "Molecule boxplot"="moleculebox",
+                                   "Radial mean score"="radial",
+                                   "Rank line"="rankline"),
+                                 selected="heatmap"),
+                    hr(),
+                    radioButtons("dock_pivot_by","Heatmap rows =",
+                                 c("Molecules"="mol","Targets (PDB ID)"="tgt"),
+                                 selected="mol"),
+                    radioButtons("dock_shape","Tile shape",
+                                 c("Square"="square","Circle"="circle"),selected="square"),
+                    selectInput("dock_palette","Colour palette",PALETTES,"RdYlBu"),
+                    numericInput("dock_legend_h","Legend height",3,1,10),
+                    sliderInput("dock_alpha","Tile alpha",0.2,1,0.9,step=0.05),
+                    numericInput("dock_text_sz","Axis text size",8,4,18),
+                    actionButton("draw_dock","Draw Heatmap",
+                                 class="btn-success btn-lg",width="100%")
+                ),
+                box(width=9, title="Molecular Docking Score Heatmap",
+                    status="success", solidHeader=TRUE,
+                    label_theme_box("dock"),
+                    withSpinner(plotOutput("plot_dock", height="600px"), type=6),
+                    p(class="plot-caption",
+                      "Colour = docking score (kcal/mol). More negative = stronger binding."))
+              )
+      ),
+
+      # ── SCORE EXPLORER ────────────────────────────────────
+      tabItem("scoreex",
+              fluidRow(
+                box(width=3, title="Parameters", status="primary", solidHeader=TRUE,
+                    dataset_picker("ds_scoreex"),
+                    hr(),
+                    div(class="override-group",
+                        tags$h6("Column roles"),
+                        uiOutput("scoreex_col_molecule"),
+                        uiOutput("scoreex_col_target"),
+                        uiOutput("scoreex_col_score"),
+                        uiOutput("scoreex_col_fraction"),
+                        uiOutput("scoreex_col_classification")
+                    ),
+                    hr(),
+                    div(class="filter-group",
+                        tags$h6("Filters"),
+                        uiOutput("scoreex_filter_fraction"),
+                        # *** FIXED: ASCII minus signs ***
+                        sliderInput("scoreex_thresh","Score <= threshold",
+                                    -15, 0, -5, step=0.5),
+                        sliderInput("scoreex_alpha","Layer alpha",0.2,1,0.8,step=0.05),
+                        numericInput("scoreex_bins","Bins",30,10,80)
+                    ),
+                    hr(),
+                     radioButtons("scoreex_type","Plot type",
+                                  c("Top hits bar"      = "topbar",
+                                    "Score distribution" = "dist",
+                                    "Score by fraction"  = "fracbox",
+                                    "Score by class"     = "classdot",
+                                    "Molecule scatter"   = "scatter",
+                                    "Density by group"   = "density",
+                                    "Target boxplot"     = "targetbox",
+                                    "ECDF"               = "ecdf",
+                                    "Fraction violin"    = "fracviolin",
+                                    "Target dot"         = "targetdot",
+                                    "Fraction mean bar"  = "fracmean",
+                                    "Class boxplot"      = "classbox",
+                                    "Mean bubble"        = "molebubble",
+                                    "Rank line"          = "rankline",
+                                    "Score rug"          = "rug"),
+                                  selected="topbar"),
+                    numericInput("scoreex_top_n","Top N hits",20,5,100),
+                    selectInput("scoreex_palette","Colour palette",PALETTES,"Spectral"),
+                    actionButton("draw_scoreex","Draw Plot",
+                                 class="btn-success btn-lg",width="100%")
+                ),
+                box(width=9, title="Docking Score Explorer",
+                    status="success", solidHeader=TRUE,
+                    label_theme_box("scoreex"),
+                    withSpinner(plotOutput("plot_scoreex", height="560px"), type=6))
+              )
+      ),
+
+      # ── CLASSIFICATION ────────────────────────────────────
+      tabItem("classif",
+              fluidRow(
+                box(width=3, title="Parameters", status="primary", solidHeader=TRUE,
+                    dataset_picker("ds_classif"),
+                    hr(),
+                    div(class="override-group",
+                        tags$h6("Column roles"),
+                        uiOutput("classif_col_classification"),
+                        uiOutput("classif_col_score"),
+                        uiOutput("classif_col_fraction"),
+                        uiOutput("classif_col_molecule")
+                    ),
+                    hr(),
+                    div(class="filter-group",
+                        tags$h6("Filters"),
+                        uiOutput("classif_filter_fraction"),
+                        # *** FIXED: ASCII minus signs ***
+                        sliderInput("classif_thresh","Score <= threshold",
+                                    -15, 0, 0, step=0.5),
+                        numericInput("classif_top_n","Top N classes",15,5,50),
+                        sliderInput("classif_alpha","Layer alpha",0.2,1,0.8,step=0.05)
+                    ),
+                    hr(),
+                     radioButtons("classif_type","Plot type",
+                                  c("Count bar"              = "count",
+                                    "Mean score bar"          = "meanscore",
+                                    "Best score dot"          = "bestdot",
+                                    "Count by fraction"       = "stackbar",
+                                    "Class x molecule heatmap"= "classheat",
+                                    "Class violin"            = "violin",
+                                    "Radial class bar"        = "radialbar",
+                                    "Median score bar"        = "medianbar",
+                                    "Fraction proportion"     = "fracprop",
+                                    "Active percentage"       = "activepct",
+                                    "Class strip plot"        = "classstrip",
+                                    "Dot-line profile"        = "dotline",
+                                    "Molecule count"          = "moleculecount",
+                                    "Fraction heatmap"        = "fractionheat"),
+                                  selected="count"),
+                    radioButtons("classif_orient","Orientation",
+                                 c("Horizontal"="horiz","Vertical"="vert"),selected="horiz"),
+                    selectInput("classif_palette","Colour palette",PALETTES,"Set2"),
+                    actionButton("draw_classif","Draw Plot",
+                                 class="btn-success btn-lg",width="100%")
+                ),
+                box(width=9, title="PDB Classification Analysis",
+                    status="success", solidHeader=TRUE,
+                    label_theme_box("classif"),
+                    withSpinner(plotOutput("plot_classif", height="560px"), type=6))
+              )
+      ),
+
+      # ── NETWORK ───────────────────────────────────────────
+      tabItem("tcmnet",
+              fluidRow(
+                box(width=3, title="Parameters", status="primary", solidHeader=TRUE,
+                    dataset_picker("ds_net"),
+                    hr(),
+                    div(class="override-group",
+                        tags$h6("Column overrides"),
+                        p(style="color:#888;font-size:11px;",
+                          "Docking: herb=FRACTIONS, molecule=Title, target=PDB ID"),
+                        uiOutput("net_col_herb"),
+                        uiOutput("net_col_molecule"),
+                        uiOutput("net_col_target")
+                    ),
+                    hr(),
+                    sliderInput("net_n","Sample N rows (0=all)",0,500,100,step=10),
+                    numericInput("net_label_deg","Label degree threshold",3,1,20),
+                    checkboxInput("net_rem_dis","Remove disconnected nodes",TRUE),
+                    selectInput("net_layout","Layout",
+                                c("kk","fr","circle","star","nicely","dh","gem"),
+                                selected="kk"),
+                    selectInput("net_color","Colour palette",PALETTES),
+                    actionButton("draw_net","Draw Network",
+                                 class="btn-success btn-lg",width="100%")
+                ),
+                box(width=9, status="success", solidHeader=TRUE,
+                    title="Network Graph",
+                    label_theme_box("net", show_xy=FALSE),
+                    withSpinner(plotOutput("plot_net", height="560px"), type=6),
+                    p(class="plot-caption",
+                      "Tip: FRACTIONS -> herb  |  Title -> molecule  |  PDB ID -> target"))
+              )
+      ),
+
+      # ── PPI ───────────────────────────────────────────────
+      tabItem("ppi",
+              fluidRow(
+                box(width=3, title="Parameters", status="primary", solidHeader=TRUE,
+                    dataset_picker("ds_ppi"),
+                    hr(),
+                    div(class="override-group",
+                        tags$h6("Column overrides"),
+                        uiOutput("ppi_col_node1"),
+                        uiOutput("ppi_col_node2"),
+                        uiOutput("ppi_col_score")
+                    ),
+                    hr(),
+                    selectInput("ppi_layout","Layout",
+                                c("kk","fr","circle","star","nicely"),selected="kk"),
+                    selectInput("ppi_color","Colour palette",PALETTES),
+                    numericInput("ppi_label_deg","Label degree",1,1,20),
+                    checkboxInput("ppi_repel","Repel labels",TRUE),
+                    numericInput("ppi_label_sz","Label size",3,1,8),
+                    actionButton("draw_ppi","Draw PPI",
+                                 class="btn-success btn-lg",width="100%")
+                ),
+                box(width=9, title="PPI Network", status="success", solidHeader=TRUE,
+                    label_theme_box("ppi", show_xy=FALSE),
+                    withSpinner(plotOutput("plot_ppi", height="560px"), type=6))
+              )
+      ),
+
+      # ── SANKEY ────────────────────────────────────────────
+      tabItem("sankey",
+              fluidRow(
+                box(width=3, title="Parameters", status="primary", solidHeader=TRUE,
+                    dataset_picker("ds_sankey"),
+                    hr(),
+                    div(class="override-group",
+                        tags$h6("Column overrides"),
+                        uiOutput("san_col_herb"),
+                        uiOutput("san_col_molecule"),
+                        uiOutput("san_col_target"),
+                        uiOutput("san_col_description")
+                    ),
+                    hr(),
+                     radioButtons("sankey_type","Diagram type",
+                                  c("Sankey (tcm_sankey)"       = "sankey",
+                                    "Alluvial (tcm_alluvial)"   = "alluvial",
+                                    "Sankey+Dot"   = "sankey_dot",
+                                    "Alluvial+Dot" = "alluvial_dot",
+                                    "TF Circle"    = "tf_cir",
+                                    "Dot Sankey 2" = "dotsankey2",
+                                    "Herb-Target bar" = "herbtargetbar",
+                                    "Molecule-Target heatmap" = "moltargetheat",
+                                    "Herb-Class-Target alluvial" = "herbclassalluvial",
+                                    "Molecule-Class-Target alluvial" = "molclassalluvial"),
+                                  selected="sankey"),
+                    sliderInput("sankey_n","Sample N rows",0,500,30,step=5),
+                    numericInput("sankey_txt_sz","Text size",3,1,8),
+                    numericInput("sankey_txt_pos","Text position",1,0,3,step=0.1),
+                    numericInput("sankey_wrap","Label wrap width",18,10,40),
+                    actionButton("draw_sankey","Draw Diagram",
+                                 class="btn-success btn-lg",width="100%")
+                ),
+                box(width=9, title="Sankey / Alluvial",
+                    status="success", solidHeader=TRUE,
+                    label_theme_box("sankey", show_xy=FALSE),
+                    withSpinner(plotOutput("plot_sankey", height="560px"), type=6))
+              )
+      ),
+
+      # ── DEGREE ────────────────────────────────────────────
+      tabItem("degree",
+              fluidRow(
+                box(width=3, title="Parameters", status="primary", solidHeader=TRUE,
+                    dataset_picker("ds_degree"),
+                    hr(),
+                    div(class="override-group",
+                        tags$h6("Column overrides"),
+                        uiOutput("deg_col_herb"),
+                        uiOutput("deg_col_molecule"),
+                        uiOutput("deg_col_target")
+                    ),
+                    hr(),
+                    radioButtons("deg_type","Plot type",
+                                 c("TCMNP degree_plot"="degree_plot",
+                                   "Radial bar"="radial",
+                                   "Lollipop"="lollipop",
+                                   "Dot plot"="dot",
+                                   "Area profile"="area",
+                                   "Cumulative degree"="cumulative",
+                                   "Heat strip"="heatstrip",
+                                   "Slope by type"="slope",
+                                   "Pareto"="pareto",
+                                   "Facet bar"="facetbar"),
+                                 selected="degree_plot"),
+                    radioButtons("deg_orient","Orientation",
+                                 c("Horizontal"="horizontal","Vertical"="vertical"),
+                                 selected="horizontal"),
+                    numericInput("deg_top_n","Top N nodes",10,5,50),
+                    numericInput("deg_text_w","Label wrap width",18,8,40),
+                    sliderInput("deg_alpha","Layer alpha",0.2,1,0.85,step=0.05),
+                    selectInput("deg_color","Colour palette",PALETTES),
+                    actionButton("draw_degree","Draw Degree Plot",
+                                 class="btn-success btn-lg",width="100%")
+                ),
+                box(width=9, title="Degree Plot (degree_plot)", status="success", solidHeader=TRUE,
+                    label_theme_box("degree"),
+                    withSpinner(plotOutput("plot_degree", height="460px"), type=6))
+              )
+      ),
+
+      # ── VENN ──────────────────────────────────────────────
+      tabItem("venn",
+              fluidRow(
+                box(width=3, title="Parameters", status="primary", solidHeader=TRUE,
+                    dataset_picker("ds_venn"),
+                    hr(),
+                    div(class="override-group",
+                        tags$h6("Column overrides"),
+                        uiOutput("venn_col_gene"),
+                        uiOutput("venn_col_dataset")
+                    ),
+                    hr(),
+                     radioButtons("venn_type","Plot type",
+                                  c("Venn (type 1)"="v1","Venn (type 2)"="v2",
+                                    "Venn Network"="vnet",
+                                    "UpSet combo bar"="upset",
+                                    "Dataset size bar"="datasetbar",
+                                    "Pairwise overlap heatmap"="overlapheat",
+                                    "Membership size plot"="membership",
+                                    "Gene frequency histogram"="genefreq",
+                                    "Pairwise overlap bar"="pairbar",
+                                    "Dataset-gene heatmap"="datasetheat"),selected="v1"),
+                    numericInput("venn_net_top","Top N genes",50,10,200),
+                    numericInput("venn_label_deg","Label degree",1,1,10),
+                    sliderInput("venn_alpha","Layer alpha",0.2,1,0.85,step=0.05),
+                    checkboxInput("venn_normalize","Normalize pairwise overlap to Jaccard",FALSE),
+                    actionButton("draw_venn","Draw Venn",
+                                 class="btn-success btn-lg",width="100%")
+                ),
+                box(width=9, title="Venn / UpSet / Venn-Network",
+                    status="success", solidHeader=TRUE,
+                    label_theme_box("venn", show_xy=FALSE),
+                    withSpinner(plotOutput("plot_venn", height="500px"), type=6))
+              )
+      ),
+
+      # ── ENRICHMENT ────────────────────────────────────────
+      tabItem("enrich",
+              fluidRow(
+                box(width=3, title="Parameters", status="primary", solidHeader=TRUE,
+                    dataset_picker("ds_enrich"),
+                    hr(),
+                    div(class="override-group",
+                        tags$h6("Column overrides"),
+                        uiOutput("enr_col_desc"),
+                        uiOutput("enr_col_count"),
+                        uiOutput("enr_col_pvalue"),
+                        uiOutput("enr_col_generatio"),
+                        uiOutput("enr_col_bgratio"),
+                        uiOutput("enr_col_geneid")
+                    ),
+                    hr(),
+                     radioButtons("enrich_type","Plot type",
+                                  c("Bar"="bar","Dot"="dot","Lollipop"="lollipop",
+                                    "Circular"="cir","Bubble"="bubble",
+                                    "GO Bar"="gobar","GO Dot"="godot",
+                                    "GO Lollipop"="golollipop","GO Circular"="gocir",
+                                    "cir_plot"="cirplot","go_cir (go.diff)"="gocirdiff",
+                                    "tf_cirplot"="tfcir","Pathway Circular (pathway_cirplot)"="pathcir",
+                                    "Pathway CC (pathway_ccplot)"="pathcc",
+                                    "Enrichment metric heatmap"="richheat",
+                                    "Count vs significance"="countp",
+                                    "Gene-link bar"="genelink",
+                                    "Dot-Sankey"="dotsan",
+                                    "Radial bar"="radialbar",
+                                    "Rich-factor bar"="richbar",
+                                    "P-value bar"="pbar",
+                                    "Ontology bar"="ontbar",
+                                    "Ontology dot"="ontdot",
+                                    "Term metric tile"="termtile",
+                                    "Term scatter"="termscatter",
+                                    "P-value histogram"="phist",
+                                    "Count histogram"="counthist",
+                                    "Gene-link heatmap"="linkheat",
+                                    "Polar bubble"="polarbubble",
+                                    "Waterfall"="waterfall",
+                                    "Term rank line"="rankline",
+                                    "Ontology stacked count"="ontstack"),selected="bar"),
+                    textInput("enrich_title","Title","KEGG"),
+                    selectInput("enrich_color","Colour palette",PALETTES),
+                    numericInput("enrich_top_n","Top N terms",20,5,100),
+                    numericInput("enrich_wrap","Label wrap width",28,12,60),
+                    sliderInput("enrich_alpha","Layer alpha",0.2,1,0.85,step=0.05),
+                    actionButton("draw_enrich","Draw Enrichment",
+                                 class="btn-success btn-lg",width="100%")
+                ),
+                box(width=9, title="Enrichment Visualisation",
+                    status="success", solidHeader=TRUE,
+                    label_theme_box("enrich"),
+                    withSpinner(plotOutput("plot_enrich", height="560px"), type=6))
+              )
+      ),
+
+      # ── EXPORT ────────────────────────────────────────────
+      tabItem("export",
+              fluidRow(
+                box(width=5, title="Export Plot", status="primary", solidHeader=TRUE,
+                    selectInput("exp_which","Which plot",
+                                c("Best Plot"="best","Docking Heatmap"="dock",
+                                  "Score Explorer"="scoreex","Classification"="classif",
+                                  "Network"="net","PPI"="ppi","Sankey"="sankey",
+                                  "Degree"="degree","Venn"="venn","Enrichment"="enrich")),
+                    radioButtons("exp_fmt","Format",
+                                 c("PNG"="png","PDF"="pdf","SVG"="svg","TIFF"="tiff"),
+                                 inline=TRUE),
+                    numericInput("exp_w","Width (in)",12,4,30),
+                    numericInput("exp_h","Height (in)",8,3,24),
+                    numericInput("exp_dpi","DPI (PNG/TIFF)",300,72,600),
+                    hr(),
+                    downloadButton("do_export","Download Plot",
+                                   class="btn-success btn-lg")
+                ),
+                box(width=7, title="Export Tips", status="info", solidHeader=TRUE,
+                    tags$ul(
+                      tags$li("Draw plot first, then export."),
+                      tags$li("PDF / SVG = vector, any resolution."),
+                      tags$li("PNG 300 DPI = standard journal requirement."),
+                      tags$li("TIFF LZW = accepted by most publishers."),
+                      tags$li("Heatmaps: width >= 16 in, height >= 14 in."),
+                      tags$li("Lollipop / violin: width = 10 in, height = 8 in.")
+                    )
+                )
+              )
+      )
+    )
+  )
+)
+
+# ─────────────────────────────────────────────────────────────
+#  SERVER
+# ─────────────────────────────────────────────────────────────
+server <- function(input, output, session) {
+
+  rv <- reactiveValues(
+    datasets = list(),
+    mappings = list(),
+    plots    = list(),
+    g_theme  = list()
+  )
+
+  dataset_names <- reactive({ names(rv$datasets) })
+
+  remap_df <- function(df, map_list) {
+    for (to in names(map_list)) {
+      fr <- map_list[[to]]
+      if (!is.null(fr) && nzchar(fr) && fr %in% names(df) && fr != to)
+        names(df)[names(df)==fr] <- to
+    }
+    df
+  }
+
+  get_mapped <- function(suffix) {
+    id <- paste0("sel_ds_",suffix)
+    nm <- input[[id]]; req(nm, rv$datasets[[nm]])
+    df <- rv$datasets[[nm]]
+    mp <- rv$mappings[[nm]]
+    if (!is.null(mp)) df <- remap_df(df, mp)
+    df
+  }
+
+  apply_col_override <- function(df, pairs) {
+    for (pair in pairs) {
+      ov <- input[[pair[1]]]; tgt <- pair[2]
+      if (!is.null(ov) && nzchar(ov) && ov %in% names(df) && ov != tgt)
+        names(df)[names(df)==ov] <- tgt
+    }
+    df
+  }
+
+  need_cols <- function(df, cols) {
+    miss <- setdiff(cols, names(df))
+    if (length(miss))
+      stop("Missing columns: ", paste(miss, collapse=", "),
+           "\n-> Use Column Mapping or Column Overrides.")
+    invisible(TRUE)
+  }
+
+  get_col <- function(override_id, df, patterns=NULL) {
+    ov <- input[[override_id]]
+    if (!is.null(ov) && nzchar(ov) && ov %in% names(df)) return(ov)
+    if (!is.null(patterns)) {
+      nms <- tolower(names(df))
+      for (p in patterns)
+        if (any(grepl(p, nms, fixed=TRUE)))
+          return(names(df)[grepl(p, nms, fixed=TRUE)][1])
+    }
+    names(df)[1]
+  }
+
+  # ── UPLOAD ───────────────────────────────────────────────
+  output$sheet_selector_single <- renderUI({
+    req(input$file_main)
+    if (tolower(tools::file_ext(input$file_main$name))=="csv") return(NULL)
+    sheets <- readxl::excel_sheets(input$file_main$datapath)
+    selectInput("sheet_single","Sheet",choices=sheets)
+  })
+
+  load_sheet <- function(path, sheet=1, header=TRUE) {
+    if (tolower(tools::file_ext(path))=="csv")
+      return(read.csv(path, header=header, stringsAsFactors=FALSE))
+    readxl::read_excel(path, sheet=sheet, col_names=header) %>% as.data.frame()
+  }
+
+  observeEvent(input$load_all, {
+    req(input$file_main)
+    if (tolower(tools::file_ext(input$file_main$name))=="csv") {
+      rv$datasets[["data"]] <- load_sheet(input$file_main$datapath)
+      showNotification("CSV loaded as 'data'", type="message"); return()
+    }
+    sheets <- readxl::excel_sheets(input$file_main$datapath)
+    ok <- fail <- character(0)
+    for (sh in sheets) {
+      tryCatch({
+        rv$datasets[[sh]] <- load_sheet(input$file_main$datapath,sh,input$has_header)
+        ok <- c(ok, sh)
+      }, error=function(e) { fail <<- c(fail, sh) })
+    }
+    showNotification(
+      paste0("Loaded: ",paste(ok,collapse=", "),
+             if(length(fail)) paste0("  Failed: ",paste(fail,collapse=", ")) else ""),
+      type="message", duration=8)
+  })
+
+  observeEvent(input$load_one, {
+    req(input$file_main)
+    sh <- if (!is.null(input$sheet_single)) input$sheet_single else 1
+    tryCatch({
+      rv$datasets[[as.character(sh)]] <-
+        load_sheet(input$file_main$datapath, sh, input$has_header)
+      showNotification(paste0("Loaded '",sh,"'"), type="message")
+    }, error=function(e) showNotification(paste("Error:",e$message), type="error"))
+  })
+
+  observeEvent(input$load_paste, {
+    req(nzchar(input$paste_data))
+    tryCatch({
+      df <- read.delim(textConnection(input$paste_data), sep="\t",
+                       header=input$has_header, stringsAsFactors=FALSE)
+      nm <- input$paste_name %||% "pasted_data"
+      rv$datasets[[nm]] <- df
+      showNotification(paste0("'",nm,"' imported - ",nrow(df)," rows"), type="message")
+    }, error=function(e) showNotification(paste("Error:",e$message), type="error"))
+  })
+
+  output$loaded_datasets_summary <- renderUI({
+    nms <- dataset_names()
+    if (!length(nms)) return(p(style="color:#999;","No datasets loaded yet."))
+    tags$ul(lapply(nms, function(nm) {
+      df <- rv$datasets[[nm]]
+      mp <- rv$mappings[[nm]]
+      badge <- if (!is.null(mp))
+        span(style="color:#00a65a;font-size:11px;"," mapped") else
+          span(style="color:#c00;font-size:11px;"," not mapped")
+      tags$li(span(class="dataset-badge",nm), badge,
+              " - ",nrow(df),"x",ncol(df),
+              " | ",em(paste(names(df),collapse=", ")))
+    }))
+  })
+
+  output$auto_detect_summary <- renderUI({
+    nms <- dataset_names(); req(length(nms))
+    df  <- rv$datasets[[nms[1]]]
+    ad  <- auto_detect_cols(df)
+    tags$table(class="table table-condensed table-bordered",
+               tags$thead(tags$tr(tags$th("Role"),tags$th("Detected column"))),
+               tags$tbody(lapply(names(ad), function(r) {
+                 v <- ad[[r]]
+                 tags$tr(tags$td(r),
+                         tags$td(if (!is.null(v) && !is.na(v))
+                           tagList(v, span(class="auto-badge","AUTO")) else
+                             em(style="color:#c00;","not found")))
+               }))
+    )
+  })
+
+  output$preview_sheet_picker <- renderUI({
+    nms <- dataset_names(); req(length(nms))
+    selectInput("preview_sheet","Preview sheet:",choices=nms,width="300px")
+  })
+
+  output$preview_table <- renderDT({
+    req(input$preview_sheet, rv$datasets[[input$preview_sheet]])
+    datatable(rv$datasets[[input$preview_sheet]],
+              options=list(scrollX=TRUE,pageLength=10), rownames=FALSE)
+  })
+
+  # ── COLUMN MAPPING ───────────────────────────────────────
+  output$colmap_sheet_picker <- renderUI({
+    nms <- dataset_names(); req(length(nms))
+    selectInput("colmap_sheet","Sheet to map:",choices=nms)
+  })
+
+  colmap_cols <- reactive({
+    req(input$colmap_sheet, rv$datasets[[input$colmap_sheet]])
+    names(rv$datasets[[input$colmap_sheet]])
+  })
+
+  output$colmap_cols_preview <- renderText({ paste(colmap_cols(),collapse="\n") })
+
+  make_map_ui <- function(out_id, label, field_key, default_name="") {
+    output[[out_id]] <- renderUI({
+      cols <- colmap_cols(); nm <- input$colmap_sheet
+      cur  <- rv$mappings[[nm]]
+      pre  <- if (!is.null(cur[[field_key]])) cur[[field_key]] else
+        if (nzchar(default_name) && default_name %in% cols) default_name else ""
+      selectInput(paste0("mp_",field_key), label,
+                  choices=c("none"="",cols), selected=pre)
+    })
+  }
+
+  make_map_ui("map_molecule_dock",   "Molecule / Compound (Title)",  "dock_molecule",  "Title")
+  make_map_ui("map_target_dock",     "Target / PDB ID",              "dock_target",    "PDB ID")
+  make_map_ui("map_score_dock",      "Docking score",                "dock_score",     "docking score")
+  make_map_ui("map_classification",  "PDB Classification",           "dock_classif",   "PDB CLASSIFICATION")
+  make_map_ui("map_fraction",        "Fraction / Group",             "dock_fraction",  "FRACTIONS")
+  make_map_ui("map_romanid",         "Roman ID",                     "dock_romanid",   "ROMANID")
+  make_map_ui("map_herb",            "herb",                         "herb",           "herb")
+  make_map_ui("map_molecule",        "molecule",                     "molecule",       "molecule")
+  make_map_ui("map_target",          "target",                       "target",         "target")
+  make_map_ui("map_description",     "Description",                  "description",    "Description")
+  make_map_ui("map_node1",           "node1 (PPI source)",           "node1",          "node1")
+  make_map_ui("map_node2",           "node2 (PPI target)",           "node2",          "node2")
+  make_map_ui("map_score",           "score (PPI weight)",           "score",          "score")
+  make_map_ui("map_gene",            "gene (Venn)",                  "gene",           "gene")
+  make_map_ui("map_dataset_col",     "dataset (Venn group)",         "dataset_col",    "dataset")
+  make_map_ui("map_enrich_desc",     "Description",                  "e_desc",         "Description")
+  make_map_ui("map_enrich_count",    "Count",                        "e_count",        "Count")
+  make_map_ui("map_enrich_pvalue",   "pvalue",                       "e_pvalue",       "pvalue")
+  make_map_ui("map_enrich_generatio","GeneRatio",                    "e_generatio",    "GeneRatio")
+  make_map_ui("map_enrich_bgratio",  "BgRatio",                      "e_bgratio",      "BgRatio")
+  make_map_ui("map_enrich_geneid",   "geneID",                       "e_geneid",       "geneID")
+
+  observeEvent(input$apply_mapping, {
+    req(input$colmap_sheet); nm <- input$colmap_sheet
+    mp <- list(
+      dock_molecule=input$mp_dock_molecule, dock_target=input$mp_dock_target,
+      dock_score=input$mp_dock_score,       dock_classif=input$mp_dock_classif,
+      dock_fraction=input$mp_dock_fraction, dock_romanid=input$mp_dock_romanid,
+      herb=input$mp_herb, molecule=input$mp_molecule, target=input$mp_target,
+      Description=input$mp_description, node1=input$mp_node1,
+      node2=input$mp_node2, score=input$mp_score,
+      gene=input$mp_gene, dataset=input$mp_dataset_col,
+      Count=input$mp_enrich_count, pvalue=input$mp_enrich_pvalue,
+      GeneRatio=input$mp_enrich_generatio, BgRatio=input$mp_enrich_bgratio,
+      geneID=input$mp_enrich_geneid
+    )
+    mp <- mp[vapply(mp, function(v) !is.null(v) && nzchar(v), logical(1))]
+    rv$mappings[[nm]] <- mp
+    showNotification(paste0("Mapping saved for '",nm,"'"), type="message")
+  })
+
+  observeEvent(input$auto_map, {
+    req(input$colmap_sheet); nm <- input$colmap_sheet
+    df <- rv$datasets[[nm]]; req(df)
+    ad <- auto_detect_cols(df)
+    mp <- list(dock_molecule=ad$molecule, dock_target=ad$target,
+               dock_score=ad$score, dock_classif=ad$description,
+               dock_fraction=ad$fraction, dock_romanid=ad$romanid)
+    mp <- mp[vapply(mp, function(v) !is.null(v) && !is.na(v) && nzchar(v), logical(1))]
+    rv$mappings[[nm]] <- mp
+    showNotification(paste0("Auto-mapped ",length(mp)," columns for '",nm,"'"),
+                     type="message")
+  })
+
+  # ── GLOBAL THEME ─────────────────────────────────────────
+  observeEvent(input$save_gtheme, {
+    rv$g_theme <- list(theme=input$g_theme, font=input$g_font,
+                       base_sz=input$g_base_sz, title_sz=input$g_title_sz,
+                       palette=input$g_palette, alpha=input$g_alpha)
+    showNotification("Global theme saved.", type="message")
+  })
+
+  # ── DATASET PICKERS ──────────────────────────────────────
+  make_ds_picker <- function(out_id, label="Dataset") {
+    output[[out_id]] <- renderUI({
+      nms <- dataset_names()
+      if (!length(nms))
+        return(p(style="color:#c00;font-size:12px;","Load data first."))
+      sel_id <- gsub("^ds_","sel_ds_",out_id)
+      tagList(
+        selectInput(sel_id, label, choices=nms, selected=nms[1]),
+        uiOutput(paste0(out_id,"_map_status"))
+      )
+    })
+    output[[paste0(out_id,"_map_status")]] <- renderUI({
+      sel_id <- gsub("^ds_","sel_ds_",out_id)
+      nm <- input[[sel_id]]; req(nm)
+      if (!is.null(rv$mappings[[nm]]))
+        span(style="color:#00a65a;font-size:11px;","Column mapping applied")
+      else
+        span(style="color:#e67e22;font-size:11px;",
+             "No mapping - use overrides or Column Mapping tab")
+    })
+  }
+
+  for (tab in c("best","dock","scoreex","classif","net","ppi",
+                "sankey","degree","venn","enrich"))
+    make_ds_picker(paste0("ds_",tab), paste("Dataset -",tab))
+
+  # ── LIVE COLUMN OVERRIDE UIs ─────────────────────────────
+  make_col_override <- function(out_id, label, ds_sel_id, auto_patterns=NULL) {
+    output[[out_id]] <- renderUI({
+      nm <- input[[ds_sel_id]]; req(nm, rv$datasets[[nm]])
+      cols <- names(rv$datasets[[nm]])
+      pre  <- ""
+      if (!is.null(auto_patterns)) {
+        lc <- tolower(cols)
+        for (pat in auto_patterns)
+          if (any(grepl(pat, lc, fixed=TRUE))) {
+            pre <- cols[grepl(pat, lc, fixed=TRUE)][1]; break }
+      }
+      selectInput(out_id, label,
+                  choices=c("(use mapping)"="",cols), selected=pre)
+    })
+  }
+
+  # Best Plots
+  make_col_override("best_col_molecule",      "Molecule (Title)",   "sel_ds_best",
+                    c("title","molecule","compound","cid"))
+  make_col_override("best_col_target",        "Target (PDB ID)",    "sel_ds_best",
+                    c("pdb id","pdb_id","target"))
+  make_col_override("best_col_score",         "Score column",       "sel_ds_best",
+                    c("docking score","score","affinity"))
+  make_col_override("best_col_fraction",      "Fraction column",    "sel_ds_best",
+                    c("fractions","fraction","group"))
+  make_col_override("best_col_classification","Classification col", "sel_ds_best",
+                    c("pdb classification","classification","class"))
+  make_col_override("best_col_romanid",       "ROMANID column",     "sel_ds_best",
+                    c("romanid","roman_id","roman"))
+  # Docking
+  make_col_override("dock_col_molecule","Molecule column (rows)","sel_ds_dock",
+                    c("title","molecule","compound"))
+  make_col_override("dock_col_target",  "Target column (cols)", "sel_ds_dock",
+                    c("pdb id","pdb_id","target"))
+  make_col_override("dock_col_score",   "Score column",         "sel_ds_dock",
+                    c("docking score","score","affinity"))
+  # Score Explorer
+  make_col_override("scoreex_col_molecule",      "Molecule","sel_ds_scoreex",c("title","molecule"))
+  make_col_override("scoreex_col_target",        "Target",  "sel_ds_scoreex",c("pdb id","target"))
+  make_col_override("scoreex_col_score",         "Score",   "sel_ds_scoreex",c("docking score","score"))
+  make_col_override("scoreex_col_fraction",      "Fraction","sel_ds_scoreex",c("fractions","fraction"))
+  make_col_override("scoreex_col_classification","Class",   "sel_ds_scoreex",c("pdb classification","classification"))
+  # Classification
+  make_col_override("classif_col_classification","Classification","sel_ds_classif",c("pdb classification","classification"))
+  make_col_override("classif_col_score",  "Score",   "sel_ds_classif",c("docking score","score"))
+  make_col_override("classif_col_fraction","Fraction","sel_ds_classif",c("fractions","fraction"))
+  make_col_override("classif_col_molecule","Molecule","sel_ds_classif",c("title","molecule"))
+  # Network
+  make_col_override("net_col_herb",    "herb col",    "sel_ds_net",c("fractions","fraction","herb"))
+  make_col_override("net_col_molecule","molecule col","sel_ds_net",c("title","molecule"))
+  make_col_override("net_col_target",  "target col",  "sel_ds_net",c("pdb id","target"))
+  # PPI
+  make_col_override("ppi_col_node1","node1","sel_ds_ppi",c("node1"))
+  make_col_override("ppi_col_node2","node2","sel_ds_ppi",c("node2"))
+  make_col_override("ppi_col_score","score","sel_ds_ppi",c("score","docking score"))
+  # Sankey
+  make_col_override("san_col_herb",       "herb",       "sel_ds_sankey",c("fractions","fraction"))
+  make_col_override("san_col_molecule",   "molecule",   "sel_ds_sankey",c("title","molecule"))
+  make_col_override("san_col_target",     "target",     "sel_ds_sankey",c("pdb id","target"))
+  make_col_override("san_col_description","Description","sel_ds_sankey",c("pdb classification"))
+  # Degree
+  make_col_override("deg_col_herb",    "herb",    "sel_ds_degree",c("fractions","fraction"))
+  make_col_override("deg_col_molecule","molecule","sel_ds_degree",c("title","molecule"))
+  make_col_override("deg_col_target",  "target",  "sel_ds_degree",c("pdb id","target"))
+  # Venn
+  make_col_override("venn_col_gene",   "gene col",   "sel_ds_venn",c("pdb id","gene","target"))
+  make_col_override("venn_col_dataset","dataset col","sel_ds_venn",c("fractions","fraction"))
+  # Enrichment
+  make_col_override("enr_col_desc",     "Description","sel_ds_enrich",c("pdb classification","description"))
+  make_col_override("enr_col_count",    "Count",       "sel_ds_enrich",c("count"))
+  make_col_override("enr_col_pvalue",   "pvalue",      "sel_ds_enrich",c("pvalue","p.value"))
+  make_col_override("enr_col_generatio","GeneRatio",   "sel_ds_enrich",c("generatio"))
+  make_col_override("enr_col_bgratio",  "BgRatio",     "sel_ds_enrich",c("bgratio"))
+  make_col_override("enr_col_geneid",   "geneID",      "sel_ds_enrich",c("geneid"))
+
+  # ── Dynamic filter UIs ───────────────────────────────────
+  make_filter_ui <- function(out_id, pattern_key, ds_sel_id, label) {
+    output[[out_id]] <- renderUI({
+      nm <- input[[ds_sel_id]]; req(nm, rv$datasets[[nm]])
+      df <- rv$datasets[[nm]]
+      nms <- tolower(names(df))
+      col <- names(df)[grepl(pattern_key, nms)][1]
+      if (is.null(col) || is.na(col)) return(NULL)
+      vals <- sort(unique(as.character(df[[col]])))
+      checkboxGroupInput(out_id, label, choices=vals, selected=vals, inline=FALSE)
+    })
+  }
+
+  make_filter_ui("best_filter_fraction",   "frac","sel_ds_best",   "Filter Fractions:")
+  make_filter_ui("dock_filter_fraction",   "frac","sel_ds_dock",   "Filter Fractions:")
+  make_filter_ui("scoreex_filter_fraction","frac","sel_ds_scoreex","Filter Fractions:")
+  make_filter_ui("classif_filter_fraction","frac","sel_ds_classif","Filter Fractions:")
+
+  output$best_radar_mol_picker <- renderUI({
+    nm <- input$sel_ds_best; req(nm, rv$datasets[[nm]])
+    df <- rv$datasets[[nm]]
+    mol_col <- get_col("best_col_molecule", df, c("title","molecule","compound","cid"))
+    mols <- sort(unique(as.character(df[[mol_col]])))
+    selectInput("best_radar_mol","Select molecule for radar:",
+                choices=mols, selected=mols[1])
+  })
+
+  # ════════════════════════════════════════════════════════
+  #  BEST PLOTS
+  # ════════════════════════════════════════════════════════
+  make_best_plot <- reactive({
+    req(input$draw_best)
+    isolate({
+      nm <- input$sel_ds_best; req(nm, rv$datasets[[nm]])
+      df <- rv$datasets[[nm]]
+
+      mol_col   <- get_col("best_col_molecule",       df, c("title","molecule","compound","cid"))
+      tgt_col   <- get_col("best_col_target",         df, c("pdb id","pdb_id","target"))
+      score_col <- get_col("best_col_score",          df, c("docking score","score","affinity"))
+      frac_col  <- get_col("best_col_fraction",       df, c("fractions","fraction","group"))
+      class_col <- get_col("best_col_classification", df, c("pdb classification","classification","class"))
+      roman_col <- get_col("best_col_romanid",        df, c("romanid","roman_id","roman"))
+
+      df[[score_col]] <- suppressWarnings(as.numeric(df[[score_col]]))
+
+      frac_vals <- input$best_filter_fraction
+      if (!is.null(frac_vals) && length(frac_vals) > 0 && frac_col %in% names(df))
+        df <- df[as.character(df[[frac_col]]) %in% frac_vals, ]
+
+      req(nrow(df) > 0, cancelOutput=TRUE)
+
+      thresh <- input$best_score_thresh
+      top_n  <- input$best_top_n
+      pal    <- input$best_palette %||% "Spectral"
+      base_s <- input$best_base_sz %||% 12
+      alpha_v <- input$best_alpha %||% 0.85
+      wrap_w  <- input$best_wrap %||% 24
+
+      # ── 1. LOLLIPOP ──────────────────────────────────
+      if (input$best_type == "lollipop") {
+        top_df <- df %>%
+          dplyr::group_by(mol = .data[[mol_col]]) %>%
+          dplyr::summarise(
+            best  = min(.data[[score_col]], na.rm=TRUE),
+            mean  = mean(.data[[score_col]], na.rm=TRUE),
+            n_tgt = dplyr::n_distinct(.data[[tgt_col]]),
+            .groups="drop") %>%
+          dplyr::arrange(best) %>%
+          dplyr::slice_head(n=top_n) %>%
+          dplyr::mutate(mol = forcats::fct_reorder(mol, best))
+
+        p <- ggplot(top_df, aes(x=best, y=mol)) +
+          geom_segment(aes(x=mean, xend=best, y=mol, yend=mol),
+                       colour="grey70", linewidth=0.8) +
+          geom_point(aes(colour=best, size=n_tgt)) +
+          geom_vline(xintercept=thresh, linetype="dashed",
+                     colour="red", alpha=0.7) +
+          scale_colour_distiller(palette=pal, direction=-1,
+                                 name="Best score\n(kcal/mol)") +
+          scale_size_continuous(name="# Targets", range=c(3,10)) +
+          annotate("text", x=thresh+0.15, y=1,
+                   label=paste0("Threshold\n(",thresh,")"),
+                   colour="red", size=3, hjust=0) +
+          labs(x="Docking score (kcal/mol)", y="Molecule (CID)",
+               title=paste0("Top ",top_n," molecules - best binding score"),
+               subtitle="Dot = best score  |  Segment left end = mean score  |  Dot size = no. targets",
+               caption="More negative = stronger binding") +
+          theme_classic(base_size=base_s) +
+          theme(plot.title=element_text(face="bold"),
+                axis.text.y=element_text(size=base_s-1))
+        return(apply_labels(p,"best",input))
+      }
+
+      # ── 2. VIOLIN ────────────────────────────────────
+      if (input$best_type == "violin") {
+        req(frac_col %in% names(df))
+        p <- ggplot(df, aes(x=.data[[frac_col]],
+                            y=.data[[score_col]],
+                            fill=.data[[frac_col]])) +
+          geom_violin(alpha=0.7, trim=FALSE, colour="white") +
+          geom_boxplot(width=0.08, fill="white", outlier.shape=NA) +
+          geom_jitter(aes(colour=.data[[score_col]]),
+                      width=0.18, alpha=0.25, size=0.9) +
+          geom_hline(yintercept=thresh, linetype="dashed",
+                     colour="red", alpha=0.8) +
+          scale_fill_brewer(palette=pal, guide="none") +
+          scale_colour_distiller(palette="RdYlBu", direction=-1,
+                                 name="Score", guide="none") +
+          annotate("text", x=0.6, y=thresh-0.2,
+                   label=paste0("Active threshold (",thresh,")"),
+                   colour="red", size=3, hjust=0) +
+          labs(x="Fraction", y="Docking score (kcal/mol)",
+               title="Score distribution by sample fraction",
+               subtitle="Inner box = IQR  |  Jitter = individual scores",
+               caption=paste0("n = ",nrow(df)," docking entries")) +
+          theme_classic(base_size=base_s) +
+          theme(axis.text.x=element_text(angle=25, hjust=1),
+                plot.title=element_text(face="bold"))
+        return(apply_labels(p,"best",input))
+      }
+
+      # ── 3. BUBBLE ────────────────────────────────────
+      if (input$best_type == "bubble") {
+        req(class_col %in% names(df), frac_col %in% names(df))
+        top_classes <- df %>%
+          dplyr::count(.data[[class_col]]) %>%
+          dplyr::arrange(dplyr::desc(n)) %>%
+          dplyr::slice_head(n=min(top_n, 20)) %>%
+          dplyr::pull(1)
+        bub <- df %>%
+          dplyr::filter(.data[[class_col]] %in% top_classes) %>%
+          dplyr::group_by(cls=.data[[class_col]], frac=.data[[frac_col]]) %>%
+          dplyr::summarise(
+            mean_score = mean(.data[[score_col]], na.rm=TRUE),
+            n          = dplyr::n(),
+            .groups="drop")
+        p <- ggplot(bub, aes(x=frac, y=cls, colour=mean_score, size=n)) +
+          geom_point(alpha=0.85) +
+          scale_colour_distiller(palette=pal, direction=-1,
+                                 name="Mean score\n(kcal/mol)") +
+          scale_size_continuous(name="Count", range=c(3,16)) +
+          labs(x="Fraction", y="PDB Classification",
+               title="Target class x fraction - bubble chart",
+               subtitle="Colour = mean score  |  Size = number of docking entries") +
+          theme_classic(base_size=base_s) +
+          theme(axis.text.x=element_text(angle=25, hjust=1),
+                axis.text.y=element_text(size=base_s-2),
+                plot.title=element_text(face="bold"))
+        return(apply_labels(p,"best",input))
+      }
+
+      # ── 4. HIT-RATE BAR ──────────────────────────────
+      if (input$best_type == "hitrate") {
+        hr_df <- df %>%
+          dplyr::group_by(mol=.data[[mol_col]]) %>%
+          dplyr::summarise(
+            total   = dplyr::n(),
+            hits    = sum(.data[[score_col]] <= thresh, na.rm=TRUE),
+            hit_pct = 100 * hits / total,
+            mean_sc = mean(.data[[score_col]], na.rm=TRUE),
+            .groups="drop") %>%
+          dplyr::filter(hits > 0) %>%
+          dplyr::arrange(dplyr::desc(hit_pct)) %>%
+          dplyr::slice_head(n=top_n) %>%
+          dplyr::mutate(mol=forcats::fct_reorder(mol, hit_pct))
+
+        p <- ggplot(hr_df, aes(x=hit_pct, y=mol, fill=mean_sc)) +
+          geom_col(alpha=0.85) +
+          geom_text(aes(label=paste0(hits,"/",total)),
+                    hjust=-0.1, size=3, colour="grey30") +
+          scale_fill_distiller(palette=pal, direction=-1,
+                               name="Mean score\n(kcal/mol)") +
+          scale_x_continuous(expand=expansion(mult=c(0,0.15))) +
+          labs(x=paste0("% targets with score <= ",thresh," kcal/mol"),
+               y="Molecule (CID)",
+               title=paste0("Hit rate - % targets bound at <= ",thresh," kcal/mol"),
+               subtitle="Label = hits / total targets tested  |  Colour = mean score") +
+          theme_classic(base_size=base_s) +
+          theme(plot.title=element_text(face="bold"),
+                axis.text.y=element_text(size=base_s-1))
+        return(apply_labels(p,"best",input))
+      }
+
+      # ── 5. RADAR ─────────────────────────────────────
+      if (input$best_type == "radar") {
+        req(class_col %in% names(df))
+        sel_mol <- input$best_radar_mol
+        req(!is.null(sel_mol) && nzchar(sel_mol))
+
+        rad <- df %>%
+          dplyr::filter(.data[[mol_col]] == sel_mol) %>%
+          dplyr::group_by(cls=.data[[class_col]]) %>%
+          dplyr::summarise(mean_sc=mean(.data[[score_col]], na.rm=TRUE),
+                           .groups="drop") %>%
+          dplyr::arrange(mean_sc) %>%
+          dplyr::slice_head(n=12)
+
+        p <- ggplot(rad, aes(x=reorder(cls, mean_sc),
+                             y=abs(mean_sc), fill=mean_sc)) +
+          geom_col(width=0.8, alpha=0.85) +
+          geom_text(aes(label=round(mean_sc,2)), vjust=-0.3, size=3) +
+          coord_polar(start=0) +
+          scale_fill_distiller(palette=pal, direction=-1,
+                               name="Mean score\n(kcal/mol)") +
+          labs(x=NULL, y="|Mean docking score|",
+               title=paste0("Target class profile - molecule ",sel_mol),
+               subtitle="Each spoke = one PDB classification  |  Length = |mean score|") +
+          theme_minimal(base_size=base_s) +
+          theme(axis.text.x=element_text(size=base_s-2, colour="grey30"),
+                plot.title=element_text(face="bold"),
+                panel.grid=element_line(colour="grey88"))
+        return(apply_labels(p,"best",input,show_xy=FALSE))
+      }
+
+      # ── 6. CLUSTERED HEATMAP ─────────────────────────
+      if (input$best_type == "heatmap") {
+        top_mols <- df %>%
+          dplyr::group_by(.data[[mol_col]]) %>%
+          dplyr::summarise(m=min(.data[[score_col]],na.rm=TRUE),.groups="drop") %>%
+          dplyr::arrange(m) %>% dplyr::slice_head(n=top_n) %>% dplyr::pull(1)
+
+        top_tgts <- df %>%
+          dplyr::filter(.data[[mol_col]] %in% top_mols) %>%
+          dplyr::group_by(.data[[tgt_col]]) %>%
+          dplyr::summarise(m=min(.data[[score_col]],na.rm=TRUE),.groups="drop") %>%
+          dplyr::arrange(m) %>% dplyr::slice_head(n=40) %>% dplyr::pull(1)
+
+        heat <- df %>%
+          dplyr::filter(.data[[mol_col]] %in% top_mols,
+                        .data[[tgt_col]] %in% top_tgts) %>%
+          dplyr::group_by(mol=.data[[mol_col]], tgt=.data[[tgt_col]]) %>%
+          dplyr::summarise(score=mean(.data[[score_col]],na.rm=TRUE),.groups="drop")
+
+        wide_h <- heat %>%
+          tidyr::pivot_wider(names_from=tgt, values_from=score, values_fill=0)
+        mat_h  <- as.matrix(wide_h[,-1])
+        rownames(mat_h) <- wide_h$mol
+
+        ord_row <- if (nrow(mat_h)>1)
+          rownames(mat_h)[hclust(dist(mat_h), method="ward.D2")$order] else
+            rownames(mat_h)
+        ord_col <- if (ncol(mat_h)>1)
+          colnames(mat_h)[hclust(dist(t(mat_h)), method="ward.D2")$order] else
+            colnames(mat_h)
+
+        heat$mol <- factor(heat$mol, levels=rev(ord_row))
+        heat$tgt <- factor(heat$tgt, levels=ord_col)
+        txt_s <- max(5, base_s - 4)
+
+        p <- ggplot(heat, aes(x=tgt, y=mol, fill=score)) +
+          geom_tile(colour="white", linewidth=0.25) +
+          scale_fill_distiller(palette=pal, direction=-1,
+                               name="Score\n(kcal/mol)", na.value="grey90") +
+          labs(x="Target (PDB ID)", y="Molecule (CID)",
+               title=paste0("Clustered docking heatmap - top ",top_n," molecules"),
+               subtitle="Rows and columns ordered by hierarchical clustering (Ward.D2)",
+               caption="Score = mean of duplicate entries") +
+          theme_classic(base_size=base_s) +
+          theme(axis.text.x=element_text(angle=70, hjust=1, size=txt_s),
+                axis.text.y=element_text(size=txt_s),
+                legend.position="right",
+                plot.title=element_text(face="bold"),
+                plot.margin=margin(10,10,10,10))
+        return(apply_labels(p,"best",input))
+      }
+
+      # ── 7. ROMANID COMPARISON ────────────────────────
+      if (input$best_type == "romanid") {
+        req(roman_col %in% names(df))
+        rom_df <- df %>%
+          dplyr::group_by(rom=.data[[roman_col]]) %>%
+          dplyr::summarise(
+            best   = min(.data[[score_col]],na.rm=TRUE),
+            mean   = mean(.data[[score_col]],na.rm=TRUE),
+            median = median(.data[[score_col]],na.rm=TRUE),
+            n_mol  = dplyr::n_distinct(.data[[mol_col]]),
+            n_ent  = dplyr::n(),
+            hit_n  = sum(.data[[score_col]] <= thresh, na.rm=TRUE),
+            .groups="drop") %>%
+          dplyr::mutate(hit_pct = 100*hit_n/n_ent,
+                        rom=forcats::fct_reorder(rom, mean))
+
+        p <- ggplot(rom_df) +
+          geom_segment(aes(x=rom, xend=rom, y=median, yend=best),
+                       colour="grey60", linewidth=0.7) +
+          geom_point(aes(x=rom, y=best,   colour=best,   size=n_mol), shape=19) +
+          geom_point(aes(x=rom, y=median, colour=median, size=n_mol), shape=1, stroke=1.2) +
+          geom_hline(yintercept=thresh, linetype="dashed", colour="red", alpha=0.7) +
+          scale_colour_distiller(palette=pal, direction=-1, name="Score\n(kcal/mol)") +
+          scale_size_continuous(name="# Molecules", range=c(3,10)) +
+          coord_flip() +
+          labs(x="ROMANID (compound group)", y="Docking score (kcal/mol)",
+               title="ROMANID compound group comparison",
+               subtitle="Filled dot = best score  |  Open dot = median  |  Size = no. unique molecules",
+               caption=paste0("Red line = active threshold (",thresh," kcal/mol)")) +
+          theme_classic(base_size=base_s) +
+          theme(plot.title=element_text(face="bold"))
+        return(apply_labels(p,"best",input))
+      }
+
+      # ── 8. BOXPLOT BY CLASS ───────────────────────────
+      if (input$best_type == "classbox") {
+        req(class_col %in% names(df))
+        top_cls <- df %>%
+          dplyr::count(.data[[class_col]]) %>%
+          dplyr::arrange(dplyr::desc(n)) %>%
+          dplyr::slice_head(n=top_n) %>% dplyr::pull(1)
+        cb_df <- df %>%
+          dplyr::filter(.data[[class_col]] %in% top_cls) %>%
+          dplyr::mutate(cls=forcats::fct_reorder(
+            .data[[class_col]],
+            .data[[score_col]], .fun=median))
+
+        p <- ggplot(cb_df, aes(x=.data[[score_col]], y=cls,
+                               fill=cls)) +
+          geom_boxplot(alpha=0.7, outlier.alpha=0.2, show.legend=FALSE) +
+          scale_fill_brewer(palette=pal) +
+          geom_vline(xintercept=thresh, linetype="dashed",
+                     colour="red", alpha=0.7) +
+          labs(x="Docking score (kcal/mol)", y="PDB Classification",
+               title="Score distribution by target protein class",
+               subtitle=paste0("Top ",top_n," most-targeted classes"),
+               caption=paste0("Red line = ",thresh," kcal/mol threshold")) +
+          theme_classic(base_size=base_s) +
+          theme(axis.text.y=element_text(size=base_s-2),
+                plot.title=element_text(face="bold"))
+        return(apply_labels(p,"best",input))
+      }
+
+      # ── 9. DUMBBELL ────────────────────────────────────
+      if (input$best_type == "dumbbell") {
+        db_df <- df %>%
+          dplyr::group_by(mol=.data[[mol_col]]) %>%
+          dplyr::summarise(
+            best=min(.data[[score_col]], na.rm=TRUE),
+            mean=mean(.data[[score_col]], na.rm=TRUE),
+            median=median(.data[[score_col]], na.rm=TRUE),
+            n_tgt=dplyr::n_distinct(.data[[tgt_col]]),
+            .groups="drop"
+          ) %>%
+          dplyr::arrange(best) %>%
+          dplyr::slice_head(n=top_n) %>%
+          dplyr::mutate(mol=forcats::fct_reorder(mol, best))
+
+        p <- ggplot(db_df, aes(y=mol)) +
+          geom_segment(aes(x=mean, xend=best, yend=mol), colour="grey70", linewidth=1) +
+          geom_point(aes(x=mean), shape=21, fill="white", colour="#2c3e50", size=3.2, stroke=1) +
+          geom_point(aes(x=best, colour=best, size=n_tgt), alpha=0.9) +
+          geom_vline(xintercept=thresh, linetype="dashed", colour="red", alpha=0.7) +
+          scale_colour_distiller(palette=pal, direction=-1, name="Best score") +
+          scale_size_continuous(name="# Targets", range=c(3, 9)) +
+          labs(x="Docking score (kcal/mol)", y="Molecule",
+               title="Best vs mean docking score per molecule",
+               subtitle="Open dot = mean score | Filled dot = best score | Segment = spread") +
+          theme_classic(base_size=base_s) +
+          theme(plot.title=element_text(face="bold"))
+        return(apply_labels(p,"best",input))
+      }
+
+      # ── 10. TARGET TILE ─────────────────────────────────
+      if (input$best_type == "targettile") {
+        top_mols <- df %>%
+          dplyr::group_by(.data[[mol_col]]) %>%
+          dplyr::summarise(best=min(.data[[score_col]], na.rm=TRUE), .groups="drop") %>%
+          dplyr::arrange(best) %>%
+          dplyr::slice_head(n=min(top_n, 20)) %>%
+          dplyr::pull(1)
+        top_tgts <- df %>%
+          dplyr::count(.data[[tgt_col]], name="n") %>%
+          dplyr::arrange(dplyr::desc(n)) %>%
+          dplyr::slice_head(n=min(top_n, 18)) %>%
+          dplyr::pull(1)
+        tt <- df %>%
+          dplyr::filter(.data[[mol_col]] %in% top_mols, .data[[tgt_col]] %in% top_tgts) %>%
+          dplyr::group_by(mol=.data[[mol_col]], tgt=.data[[tgt_col]]) %>%
+          dplyr::summarise(score=mean(.data[[score_col]], na.rm=TRUE), .groups="drop")
+
+        p <- ggplot(tt, aes(x=tgt, y=mol, fill=score)) +
+          geom_tile(colour="white", linewidth=0.25) +
+          scale_fill_distiller(palette=pal, direction=-1, name="Mean score") +
+          labs(x="Target (PDB ID)", y="Molecule",
+               title="Top molecules x targets tile map",
+               subtitle="Colour encodes mean docking score for each molecule-target pair") +
+          theme_classic(base_size=base_s) +
+          theme(axis.text.x=element_text(angle=60, hjust=1, size=base_s-3),
+                axis.text.y=element_text(size=base_s-2),
+                plot.title=element_text(face="bold"))
+        return(apply_labels(p,"best",input))
+      }
+
+      # ── 11. RADIAL BAR ──────────────────────────────────
+      if (input$best_type == "radialbar") {
+        rb <- df %>%
+          dplyr::group_by(mol=.data[[mol_col]]) %>%
+          dplyr::summarise(best=min(.data[[score_col]], na.rm=TRUE),
+                           hits=sum(.data[[score_col]] <= thresh, na.rm=TRUE),
+                           .groups="drop") %>%
+          dplyr::arrange(best) %>%
+          dplyr::slice_head(n=top_n) %>%
+          dplyr::mutate(mol=wrap_text_vec(mol, wrap_w),
+                        mol=factor(mol, levels=mol),
+                        score_abs=abs(best))
+        p <- ggplot(rb, aes(x=mol, y=score_abs, fill=best)) +
+          geom_col(alpha=alpha_v, width=0.85) +
+          coord_polar() +
+          scale_fill_distiller(palette=pal, direction=-1, name="Best score") +
+          labs(x=NULL, y="|Best score|",
+               title="Radial bar plot of top-binding molecules",
+               subtitle="Bar length reflects absolute best docking score") +
+          theme_minimal(base_size=base_s) +
+          theme(axis.text.x=element_text(size=max(6, base_s-3)),
+                plot.title=element_text(face="bold"))
+        return(apply_labels(p,"best",input,show_xy=FALSE))
+      }
+
+      # ── 12. SLOPE ───────────────────────────────────────
+      if (input$best_type == "slope") {
+        sl <- df %>%
+          dplyr::group_by(mol=.data[[mol_col]]) %>%
+          dplyr::summarise(best=min(.data[[score_col]], na.rm=TRUE),
+                           median=median(.data[[score_col]], na.rm=TRUE),
+                           .groups="drop") %>%
+          dplyr::arrange(best) %>%
+          dplyr::slice_head(n=top_n) %>%
+          dplyr::mutate(mol=wrap_text_vec(mol, wrap_w))
+        sl2 <- sl %>%
+          tidyr::pivot_longer(c(best, median), names_to="metric", values_to="score")
+        p <- ggplot(sl2, aes(x=metric, y=score, group=mol, colour=mol)) +
+          geom_line(alpha=alpha_v) +
+          geom_point(size=2.2) +
+          guides(colour="none") +
+          labs(x=NULL, y="Docking score (kcal/mol)",
+               title="Best versus median score slope profile",
+               subtitle="Each line represents one molecule") +
+          theme_classic(base_size=base_s)
+        return(apply_labels(p,"best",input))
+      }
+
+      # ── 13. FRACTION STACK ──────────────────────────────
+      if (input$best_type == "fracstack") {
+        req(frac_col %in% names(df))
+        fs <- df %>%
+          dplyr::mutate(status=ifelse(.data[[score_col]] <= thresh, "Active", "Inactive")) %>%
+          dplyr::count(frac=.data[[frac_col]], status, name="n") %>%
+          dplyr::group_by(frac) %>%
+          dplyr::mutate(pct=100 * n / sum(n)) %>%
+          dplyr::ungroup()
+        p <- ggplot(fs, aes(x=frac, y=pct, fill=status)) +
+          geom_col(alpha=alpha_v) +
+          scale_fill_brewer(palette="Set1") +
+          labs(x="Fraction", y="Percent of docking entries",
+               title="Active versus inactive composition by fraction",
+               subtitle=paste0("Active defined as score <= ", thresh)) +
+          theme_classic(base_size=base_s) +
+          theme(axis.text.x=element_text(angle=25, hjust=1))
+        return(apply_labels(p,"best",input))
+      }
+
+      # ── 14. TARGET LOLLIPOP ─────────────────────────────
+      if (input$best_type == "targetlollipop") {
+        tl <- df %>%
+          dplyr::group_by(tgt=.data[[tgt_col]]) %>%
+          dplyr::summarise(best=min(.data[[score_col]], na.rm=TRUE),
+                           mean=mean(.data[[score_col]], na.rm=TRUE),
+                           n_mol=dplyr::n_distinct(.data[[mol_col]]),
+                           .groups="drop") %>%
+          dplyr::arrange(best) %>%
+          dplyr::slice_head(n=top_n) %>%
+          dplyr::mutate(tgt=forcats::fct_reorder(wrap_text_vec(tgt, wrap_w), best))
+        p <- ggplot(tl, aes(x=best, y=tgt)) +
+          geom_segment(aes(x=mean, xend=best, yend=tgt), colour="grey75", linewidth=0.9) +
+          geom_point(aes(size=n_mol, colour=best), alpha=alpha_v) +
+          scale_colour_distiller(palette=pal, direction=-1, name="Best score") +
+          scale_size_continuous(name="# Molecules", range=c(3, 10)) +
+          labs(x="Docking score (kcal/mol)", y="Target",
+               title="Target-level lollipop profile",
+               subtitle="Highlights targets attracting the strongest molecule scores") +
+          theme_classic(base_size=base_s)
+        return(apply_labels(p,"best",input))
+      }
+
+      # ── 15. TARGET COUNT ────────────────────────────────
+      if (input$best_type == "targetcount") {
+        tc <- df %>%
+          dplyr::group_by(tgt=.data[[tgt_col]]) %>%
+          dplyr::summarise(n=dplyr::n(),
+                           active=sum(.data[[score_col]] <= thresh, na.rm=TRUE),
+                           .groups="drop") %>%
+          dplyr::arrange(dplyr::desc(active), dplyr::desc(n)) %>%
+          dplyr::slice_head(n=top_n) %>%
+          dplyr::mutate(tgt=forcats::fct_reorder(wrap_text_vec(tgt, wrap_w), active))
+        p <- ggplot(tc, aes(x=active, y=tgt, fill=n)) +
+          geom_col(alpha=alpha_v) +
+          scale_fill_distiller(palette=pal, direction=1, name="Total pairs") +
+          labs(x="Active molecule-target pairs", y="Target",
+               title="Targets ranked by active docking counts",
+               subtitle="Useful for spotting broadly bindable targets") +
+          theme_classic(base_size=base_s)
+        return(apply_labels(p,"best",input))
+      }
+
+      # ── 16. DENSITY BY CLASS ────────────────────────────
+      if (input$best_type == "densityclass") {
+        req(class_col %in% names(df))
+        top_cls <- df %>% dplyr::count(.data[[class_col]], name="n") %>%
+          dplyr::arrange(dplyr::desc(n)) %>% dplyr::slice_head(n=min(6, top_n)) %>% dplyr::pull(1)
+        dd <- df %>% dplyr::filter(.data[[class_col]] %in% top_cls)
+        p <- ggplot(dd, aes(x=.data[[score_col]], fill=.data[[class_col]], colour=.data[[class_col]])) +
+          geom_density(alpha=0.18, linewidth=0.9) +
+          labs(x="Docking score (kcal/mol)", y="Density",
+               fill="Class", colour="Class",
+               title="Density of docking scores by top protein classes") +
+          theme_classic(base_size=base_s)
+        return(apply_labels(p,"best",input))
+      }
+
+      # ── 17. ECDF ────────────────────────────────────────
+      if (input$best_type == "ecdf") {
+        grp <- if (frac_col %in% names(df)) frac_col else tgt_col
+        p <- ggplot(df, aes(x=.data[[score_col]], colour=.data[[grp]])) +
+          stat_ecdf(linewidth=0.9, alpha=alpha_v) +
+          geom_vline(xintercept=thresh, linetype="dashed", colour="red", alpha=0.6) +
+          labs(x="Docking score (kcal/mol)", y="Cumulative proportion",
+               colour=grp,
+               title="Empirical cumulative docking profile") +
+          theme_classic(base_size=base_s)
+        return(apply_labels(p,"best",input))
+      }
+
+      # ── 18. MEAN SCATTER ───────────────────────────────
+      if (input$best_type == "meanscatter") {
+        ms <- df %>%
+          dplyr::group_by(mol=.data[[mol_col]]) %>%
+          dplyr::summarise(best=min(.data[[score_col]], na.rm=TRUE),
+                           mean=mean(.data[[score_col]], na.rm=TRUE),
+                           n_tgt=dplyr::n_distinct(.data[[tgt_col]]),
+                           .groups="drop") %>%
+          dplyr::arrange(best) %>%
+          dplyr::slice_head(n=top_n)
+        p <- ggplot(ms, aes(x=mean, y=best, size=n_tgt, colour=best)) +
+          geom_abline(slope=1, intercept=0, linetype="dashed", colour="grey65") +
+          geom_point(alpha=alpha_v) +
+          scale_colour_distiller(palette=pal, direction=-1, name="Best score") +
+          scale_size_continuous(name="# Targets", range=c(3, 10)) +
+          labs(x="Mean score (kcal/mol)", y="Best score (kcal/mol)",
+               title="Mean versus best score per molecule",
+               subtitle="Points farther below the diagonal show stronger best-case gains") +
+          theme_classic(base_size=base_s)
+        return(apply_labels(p,"best",input))
+      }
+    })
+  })
+
+  output$plot_best <- renderPlot({
+    p <- tryCatch(make_best_plot(),
+                  error=function(e) {
+                    showNotification(paste("Plot error:",e$message), type="error")
+                    NULL
+                  })
+    req(!is.null(p))
+    rv$plots[["best"]] <- p
+    p
+  })
+
+  output$best_stats_ui <- renderUI({
+    nm <- input$sel_ds_best; req(nm, rv$datasets[[nm]], input$draw_best)
+    df <- isolate(rv$datasets[[nm]])
+    score_col <- isolate(get_col("best_col_score", df,
+                                 c("docking score","score","affinity")))
+    mol_col   <- isolate(get_col("best_col_molecule", df,
+                                 c("title","molecule","compound","cid")))
+    tgt_col   <- isolate(get_col("best_col_target", df,
+                                 c("pdb id","pdb_id","target")))
+    thresh    <- isolate(input$best_score_thresh)
+    sc <- suppressWarnings(as.numeric(df[[score_col]]))
+    sc <- sc[!is.na(sc)]
+    n_active <- sum(sc <= thresh)
+    fluidRow(
+      valueBox(length(sc),
+               "Total docking entries",  icon=icon("database"),
+               color="green",  width=3),
+      valueBox(dplyr::n_distinct(df[[mol_col]]),
+               "Unique molecules",
+               icon=icon("flask"), color="blue",  width=3),
+      valueBox(dplyr::n_distinct(df[[tgt_col]]),
+               "Unique targets (PDB IDs)",
+               icon=icon("dna"),   color="purple", width=3),
+      valueBox(paste0(n_active," (",round(100*n_active/length(sc),1),"%)"),
+               paste0("Active (score <= ",thresh,")"),
+               icon=icon("star"),  color="red",    width=3)
+    )
+  })
+
+  # ════════════════════════════════════════════════════════
+  #  DOCKING HEATMAP
+  # ════════════════════════════════════════════════════════
+  make_dock_plot <- reactive({
+    req(input$draw_dock)
+    isolate({
+      nm <- input$sel_ds_dock; req(nm, rv$datasets[[nm]])
+      df <- rv$datasets[[nm]]
+      mol_col   <- get_col("dock_col_molecule",df,c("title","molecule","compound"))
+      tgt_col   <- get_col("dock_col_target",  df,c("pdb id","pdb_id","target"))
+      score_col <- get_col("dock_col_score",   df,c("docking score","score","affinity"))
+      df[[score_col]] <- suppressWarnings(as.numeric(df[[score_col]]))
+
+      frac_real <- {
+        nms <- tolower(names(df))
+        names(df)[grepl("frac", nms)][1]
+      }
+      if (!is.null(frac_real) && !is.na(frac_real) &&
+          !is.null(input$dock_filter_fraction))
+        df <- df[as.character(df[[frac_real]]) %in% input$dock_filter_fraction,]
+
+      if (input$dock_score_thresh > 0)
+        df <- df[abs(df[[score_col]]) >= input$dock_score_thresh, ]
+      req(nrow(df) > 0, cancelOutput=TRUE)
+
+      top_mols <- df %>%
+        dplyr::group_by(.data[[mol_col]]) %>%
+        dplyr::summarise(m=mean(.data[[score_col]],na.rm=TRUE),.groups="drop") %>%
+        dplyr::arrange(m) %>% dplyr::slice_head(n=input$dock_top_n) %>% dplyr::pull(1)
+      df <- df[df[[mol_col]] %in% top_mols,]
+
+      row_col <- if (input$dock_pivot_by=="mol") mol_col else tgt_col
+      col_col <- if (input$dock_pivot_by=="mol") tgt_col else mol_col
+
+      mat <- tryCatch(
+        pivot_to_matrix(df, row_col, col_col, score_col),
+        error=function(e) {
+          showNotification(paste("Pivot error:",e$message), type="error"); NULL })
+      req(!is.null(mat))
+
+      mat_df <- as.data.frame(mat) %>%
+        tibble::rownames_to_column("row_id") %>%
+        tidyr::pivot_longer(-row_id, names_to="col_id", values_to="score")
+
+      pal    <- input$dock_palette %||% "RdYlBu"
+      txt_sz <- input$dock_text_sz %||% 8
+      alp    <- input$dock_alpha   %||% 0.9
+      bins   <- input$dock_bins %||% 12
+      tgt_sum <- df %>%
+        dplyr::group_by(tgt=.data[[tgt_col]]) %>%
+        dplyr::summarise(mean_sc=mean(.data[[score_col]], na.rm=TRUE),
+                         med_sc=median(.data[[score_col]], na.rm=TRUE),
+                         n=dplyr::n(), .groups="drop") %>%
+        dplyr::arrange(mean_sc) %>%
+        dplyr::slice_head(n=min(input$dock_top_n, 20))
+      mol_sum <- df %>%
+        dplyr::group_by(mol=.data[[mol_col]]) %>%
+        dplyr::summarise(mean_sc=mean(.data[[score_col]], na.rm=TRUE),
+                         best=min(.data[[score_col]], na.rm=TRUE),
+                         n=dplyr::n(), .groups="drop") %>%
+        dplyr::arrange(mean_sc) %>%
+        dplyr::slice_head(n=min(input$dock_top_n, 20))
+      row_levels <- unique(mat_df$row_id)
+      col_levels <- unique(mat_df$col_id)
+      mat_df$row_num <- match(mat_df$row_id, row_levels)
+      mat_df$col_num <- match(mat_df$col_id, col_levels)
+
+      final_p <- switch(input$dock_type,
+        heatmap = {
+          p <- if (input$dock_shape == "square") {
+            ggplot(mat_df, aes(x=col_id, y=row_id, fill=score)) +
+              geom_tile(colour="white", linewidth=0.25, alpha=alp) +
+              scale_fill_distiller(palette=pal, name="Score\n(kcal/mol)",
+                                   direction=-1, na.value="grey90")
+          } else {
+            ggplot(mat_df, aes(x=col_id, y=row_id, colour=score, size=abs(score))) +
+              geom_point(alpha=alp) +
+              scale_colour_distiller(palette=pal, name="Score\n(kcal/mol)", direction=-1) +
+              scale_size_continuous(name="|Score|", range=c(1,8))
+          }
+          p <- p + theme_classic(base_size=txt_sz) +
+            theme(axis.text.x=element_text(angle=60,hjust=1,size=txt_sz-1),
+                  axis.text.y=element_text(size=txt_sz-1),
+                  axis.title=element_blank(), legend.position="right",
+                  plot.margin=margin(10,10,10,10))
+          p2 <- tryCatch(
+            TCMNP::dock_plot(mat, shape=input$dock_shape,
+                             legend.height=input$dock_legend_h),
+            error=function(e) NULL)
+          if (!is.null(p2)) p2 else p
+        },
+        bubble = {
+          ggplot(mat_df, aes(x=col_id, y=row_id, size=abs(score), colour=score)) +
+            geom_point(alpha=alp) +
+            scale_colour_distiller(palette=pal, direction=-1, name="Score") +
+            scale_size_continuous(name="|Score|", range=c(1,10)) +
+            labs(x=NULL, y=NULL, title="Bubble matrix of docking scores") +
+            theme_classic(base_size=txt_sz) +
+            theme(axis.text.x=element_text(angle=60, hjust=1))
+        },
+        strip = {
+          ggplot(mat_df, aes(x=col_id, y=row_id, fill=score)) +
+            geom_raster() +
+            scale_fill_distiller(palette=pal, direction=-1, name="Score") +
+            labs(x=NULL, y=NULL, title="Docking strip heatmap") +
+            theme_minimal(base_size=txt_sz) +
+            theme(axis.text.x=element_text(angle=60, hjust=1))
+        },
+        contour = {
+          ggplot(mat_df, aes(x=col_num, y=row_num, z=score)) +
+            geom_contour_filled(bins=bins, alpha=alp) +
+            scale_x_continuous(breaks=seq_along(col_levels), labels=col_levels) +
+            scale_y_continuous(breaks=seq_along(row_levels), labels=row_levels) +
+            labs(x=if (input$dock_pivot_by=="mol") "Target" else "Molecule",
+                 y=if (input$dock_pivot_by=="mol") "Molecule" else "Target",
+                 title="Contour map of docking intensities") +
+            theme_classic(base_size=txt_sz) +
+            theme(axis.text.x=element_text(angle=60, hjust=1, size=txt_sz-1),
+                  axis.text.y=element_text(size=txt_sz-1))
+        },
+        targetbar = {
+          ggplot(tgt_sum, aes(x=mean_sc, y=forcats::fct_reorder(tgt, mean_sc), fill=n)) +
+            geom_col(alpha=alp) +
+            scale_fill_distiller(palette=pal, direction=1, name="Pairs") +
+            labs(x="Mean score (kcal/mol)", y="Target",
+                 title="Target summary bar plot") +
+            theme_classic(base_size=txt_sz)
+        },
+        targetbox = {
+          top_tgts <- tgt_sum$tgt
+          bx <- df %>% dplyr::filter(.data[[tgt_col]] %in% top_tgts) %>%
+            dplyr::mutate(tgt=forcats::fct_reorder(.data[[tgt_col]], .data[[score_col]], .fun=median))
+          ggplot(bx, aes(x=.data[[score_col]], y=tgt, fill=tgt)) +
+            geom_boxplot(alpha=alp, outlier.alpha=0.15, show.legend=FALSE) +
+            scale_fill_brewer(palette="Set3") +
+            labs(x="Docking score (kcal/mol)", y="Target",
+                 title="Distribution of docking scores across top targets") +
+            theme_classic(base_size=txt_sz)
+        },
+        moleculebox = {
+          top_mols2 <- mol_sum$mol
+          bx <- df %>% dplyr::filter(.data[[mol_col]] %in% top_mols2) %>%
+            dplyr::mutate(mol=forcats::fct_reorder(.data[[mol_col]], .data[[score_col]], .fun=median))
+          ggplot(bx, aes(x=.data[[score_col]], y=mol, fill=mol)) +
+            geom_boxplot(alpha=alp, outlier.alpha=0.15, show.legend=FALSE) +
+            scale_fill_brewer(palette="Set3") +
+            labs(x="Docking score (kcal/mol)", y="Molecule",
+                 title="Distribution of docking scores across top molecules") +
+            theme_classic(base_size=txt_sz)
+        },
+        radial = {
+          rd <- mol_sum %>% dplyr::mutate(mol=wrap_text_vec(mol, 18), mean_abs=abs(mean_sc))
+          ggplot(rd, aes(x=factor(mol, levels=mol), y=mean_abs, fill=mean_sc)) +
+            geom_col(alpha=alp) +
+            coord_polar() +
+            scale_fill_distiller(palette=pal, direction=-1, name="Mean score") +
+            labs(x=NULL, y="|Mean score|", title="Radial mean-score profile") +
+            theme_minimal(base_size=txt_sz)
+        },
+        rankline = {
+          rk <- df %>% dplyr::arrange(.data[[score_col]]) %>%
+            dplyr::slice_head(n=min(nrow(df), max(50, input$dock_top_n * 10))) %>%
+            dplyr::mutate(rank=dplyr::row_number())
+          ggplot(rk, aes(x=rank, y=.data[[score_col]], colour=.data[[tgt_col]])) +
+            geom_line(alpha=alp) +
+            geom_point(alpha=alp, size=1.4) +
+            labs(x="Ranked interaction", y="Docking score (kcal/mol)", colour="Target",
+                 title="Rank-ordered docking score line plot") +
+            theme_classic(base_size=txt_sz)
+        }
+      )
+      apply_labels(final_p,"dock",input)
+    })
+  })
+  output$plot_dock <- renderPlot({ p<-make_dock_plot(); rv$plots[["dock"]]<-p; p })
+
+  # ════════════════════════════════════════════════════════
+  #  SCORE EXPLORER
+  # ════════════════════════════════════════════════════════
+  make_scoreex_plot <- reactive({
+    req(input$draw_scoreex)
+    isolate({
+      nm <- input$sel_ds_scoreex; req(nm, rv$datasets[[nm]])
+      df <- rv$datasets[[nm]]
+      mol_col   <- get_col("scoreex_col_molecule",      df,c("title","molecule"))
+      tgt_col   <- get_col("scoreex_col_target",        df,c("pdb id","target"))
+      score_col <- get_col("scoreex_col_score",         df,c("docking score","score"))
+      frac_col  <- get_col("scoreex_col_fraction",      df,c("fractions","fraction"))
+      class_col <- get_col("scoreex_col_classification",df,c("pdb classification","classification"))
+      df[[score_col]] <- suppressWarnings(as.numeric(df[[score_col]]))
+      if (!is.null(input$scoreex_filter_fraction) &&
+          length(input$scoreex_filter_fraction)>0 && frac_col %in% names(df))
+        df <- df[as.character(df[[frac_col]]) %in% input$scoreex_filter_fraction,]
+      if (input$scoreex_thresh < 0)
+        df <- df[!is.na(df[[score_col]]) & df[[score_col]] <= input$scoreex_thresh,]
+      req(nrow(df)>0, cancelOutput=TRUE)
+      pal   <- input$scoreex_palette %||% "Spectral"
+      top_n <- input$scoreex_top_n
+      alpha_v <- input$scoreex_alpha %||% 0.8
+      bins_v  <- input$scoreex_bins %||% 30
+
+      p <- switch(input$scoreex_type,
+                  topbar = {
+                    td <- df %>%
+                      dplyr::group_by(across(all_of(mol_col))) %>%
+                      dplyr::summarise(best=min(.data[[score_col]],na.rm=TRUE),.groups="drop") %>%
+                      dplyr::arrange(best) %>% dplyr::slice_head(n=top_n) %>%
+                      dplyr::mutate(mol=forcats::fct_reorder(.data[[mol_col]],best))
+                    ggplot(td,aes(x=mol,y=best,fill=best)) +
+                      geom_col(show.legend=FALSE) +
+                      scale_fill_distiller(palette=pal,direction=-1) +
+                      coord_flip() +
+                      labs(x="Molecule",y="Best score (kcal/mol)",
+                           title=paste0("Top ",top_n," by best score"))
+                  },
+                  dist = {
+                    ggplot(df,aes(x=.data[[score_col]])) +
+                      geom_histogram(aes(fill=after_stat(x)),bins=bins_v,colour="white", alpha=alpha_v) +
+                      scale_fill_distiller(palette=pal,direction=-1,guide="none") +
+                      geom_vline(xintercept=mean(df[[score_col]],na.rm=TRUE),
+                                 linetype="dashed",colour="black") +
+                      labs(x="Docking score (kcal/mol)",y="Count",title="Score distribution")
+                  },
+                  fracbox = {
+                    req(frac_col %in% names(df))
+                    ggplot(df,aes(x=.data[[frac_col]],y=.data[[score_col]],
+                                  fill=.data[[frac_col]])) +
+                      geom_boxplot(outlier.alpha=0.3,alpha=alpha_v) +
+                      geom_jitter(width=0.15,alpha=0.2,size=0.6) +
+                      scale_fill_brewer(palette=pal,guide="none") +
+                      labs(x="Fraction",y="Docking score (kcal/mol)",
+                           title="Score by fraction") +
+                      theme(axis.text.x=element_text(angle=30,hjust=1))
+                  },
+                  classdot = {
+                    req(class_col %in% names(df))
+                    cd <- df %>%
+                      dplyr::group_by(across(all_of(class_col))) %>%
+                      dplyr::summarise(mean_sc=mean(.data[[score_col]],na.rm=TRUE),
+                                       n=dplyr::n(),.groups="drop") %>%
+                      dplyr::arrange(mean_sc) %>% dplyr::slice_head(n=top_n) %>%
+                      dplyr::mutate(cls=forcats::fct_reorder(.data[[class_col]],mean_sc))
+                    ggplot(cd,aes(x=mean_sc,y=cls,colour=mean_sc,size=n)) +
+                      geom_point() +
+                      scale_colour_distiller(palette=pal,direction=-1,name="Mean score") +
+                      scale_size_continuous(name="Count",range=c(2,10)) +
+                      labs(x="Mean score (kcal/mol)",y="PDB Classification",
+                           title="Mean score by classification")
+                  },
+                  scatter = {
+                    sd2 <- if(nrow(df)>2000) dplyr::sample_n(df,2000) else df
+                    cv  <- if(frac_col %in% names(df)) frac_col else mol_col
+                    ggplot(sd2,aes(x=.data[[mol_col]],y=.data[[score_col]],
+                                   colour=.data[[cv]])) +
+                      geom_jitter(alpha=alpha_v,size=1.2,width=0.3) +
+                       scale_colour_brewer(palette=pal) +
+                       labs(x="Molecule",y="Score (kcal/mol)",colour=cv,
+                            title="Score scatter by molecule") +
+                       theme(axis.text.x=element_text(angle=60,hjust=1,size=7))
+                  },
+                  density = {
+                    grp <- if (frac_col %in% names(df)) frac_col else
+                      if (class_col %in% names(df)) class_col else tgt_col
+                    ggplot(df, aes(x=.data[[score_col]], fill=.data[[grp]], colour=.data[[grp]])) +
+                      geom_density(alpha=0.18, linewidth=0.8) +
+                      labs(x="Docking score (kcal/mol)", y="Density", fill=grp, colour=grp,
+                           title="Score density by analytical group") +
+                      theme_classic()
+                  },
+                  targetbox = {
+                    tb <- df %>%
+                      dplyr::count(.data[[tgt_col]], name="n") %>%
+                      dplyr::arrange(dplyr::desc(n)) %>%
+                      dplyr::slice_head(n=top_n) %>%
+                      dplyr::pull(1)
+                    bx <- df %>%
+                      dplyr::filter(.data[[tgt_col]] %in% tb) %>%
+                      dplyr::mutate(tgt=forcats::fct_reorder(.data[[tgt_col]], .data[[score_col]], .fun=median))
+                    ggplot(bx, aes(x=.data[[score_col]], y=tgt, fill=tgt)) +
+                      geom_boxplot(alpha=alpha_v, outlier.alpha=0.18, show.legend=FALSE) +
+                      scale_fill_brewer(palette=pal) +
+                      labs(x="Docking score (kcal/mol)", y="Target",
+                           title="Score spread across top targets") +
+                      theme_classic()
+                  },
+                  ecdf = {
+                    grp <- if (frac_col %in% names(df)) frac_col else tgt_col
+                    ggplot(df, aes(x=.data[[score_col]], colour=.data[[grp]])) +
+                      stat_ecdf(linewidth=0.9, alpha=alpha_v) +
+                      labs(x="Docking score (kcal/mol)", y="Cumulative proportion", colour=grp,
+                           title="Empirical cumulative score profile") +
+                      theme_classic()
+                  },
+                  fracviolin = {
+                    req(frac_col %in% names(df))
+                    ggplot(df, aes(x=.data[[frac_col]], y=.data[[score_col]], fill=.data[[frac_col]])) +
+                      geom_violin(alpha=alpha_v, trim=FALSE, show.legend=FALSE) +
+                      geom_boxplot(width=0.1, fill="white", outlier.alpha=0.15) +
+                      scale_fill_brewer(palette=pal) +
+                      labs(x="Fraction", y="Docking score (kcal/mol)",
+                           title="Fraction-wise violin score profile") +
+                      theme_classic() +
+                      theme(axis.text.x=element_text(angle=30,hjust=1))
+                  },
+                  targetdot = {
+                    td <- df %>%
+                      dplyr::group_by(across(all_of(tgt_col))) %>%
+                      dplyr::summarise(mean_sc=mean(.data[[score_col]],na.rm=TRUE),
+                                       best=min(.data[[score_col]],na.rm=TRUE),
+                                       n=dplyr::n(), .groups="drop") %>%
+                      dplyr::arrange(best) %>% dplyr::slice_head(n=top_n) %>%
+                      dplyr::mutate(tgt=forcats::fct_reorder(.data[[tgt_col]], best))
+                    ggplot(td, aes(x=best, y=tgt, size=n, colour=mean_sc)) +
+                      geom_point(alpha=alpha_v) +
+                      scale_colour_distiller(palette=pal, direction=-1, name="Mean score") +
+                      scale_size_continuous(name="Count", range=c(3,10)) +
+                      labs(x="Best score (kcal/mol)", y="Target",
+                           title="Target dot summary") +
+                      theme_classic()
+                  },
+                  fracmean = {
+                    req(frac_col %in% names(df))
+                    fm <- df %>% dplyr::group_by(across(all_of(frac_col))) %>%
+                      dplyr::summarise(mean_sc=mean(.data[[score_col]], na.rm=TRUE),
+                                       med_sc=median(.data[[score_col]], na.rm=TRUE),
+                                       n=dplyr::n(), .groups="drop") %>%
+                      dplyr::mutate(frac=forcats::fct_reorder(.data[[frac_col]], mean_sc))
+                    ggplot(fm, aes(x=frac, y=mean_sc, fill=n)) +
+                      geom_col(alpha=alpha_v) +
+                      geom_point(aes(y=med_sc), colour="black", size=2) +
+                      scale_fill_distiller(palette=pal, direction=1, name="Count") +
+                      labs(x="Fraction", y="Mean score (kcal/mol)",
+                           title="Mean and median score by fraction",
+                           subtitle="Black point marks median") +
+                      theme_classic() +
+                      theme(axis.text.x=element_text(angle=30,hjust=1))
+                  },
+                  classbox = {
+                    req(class_col %in% names(df))
+                    cls <- df %>% dplyr::count(.data[[class_col]], name="n") %>%
+                      dplyr::arrange(dplyr::desc(n)) %>% dplyr::slice_head(n=top_n) %>% dplyr::pull(1)
+                    bx <- df %>% dplyr::filter(.data[[class_col]] %in% cls) %>%
+                      dplyr::mutate(cls=forcats::fct_reorder(.data[[class_col]], .data[[score_col]], .fun=median))
+                    ggplot(bx, aes(x=.data[[score_col]], y=cls, fill=cls)) +
+                      geom_boxplot(alpha=alpha_v, show.legend=FALSE, outlier.alpha=0.15) +
+                      scale_fill_brewer(palette=pal) +
+                      labs(x="Docking score (kcal/mol)", y="Class",
+                           title="Class-level boxplot explorer") +
+                      theme_classic()
+                  },
+                  molebubble = {
+                    mb <- df %>%
+                      dplyr::group_by(across(all_of(mol_col))) %>%
+                      dplyr::summarise(mean_sc=mean(.data[[score_col]], na.rm=TRUE),
+                                       best=min(.data[[score_col]], na.rm=TRUE),
+                                       n_tgt=dplyr::n_distinct(.data[[tgt_col]]),
+                                       .groups="drop") %>%
+                      dplyr::arrange(best) %>% dplyr::slice_head(n=top_n)
+                    ggplot(mb, aes(x=mean_sc, y=best, size=n_tgt, colour=mean_sc)) +
+                      geom_point(alpha=alpha_v) +
+                      scale_colour_distiller(palette=pal, direction=-1, name="Mean score") +
+                      scale_size_continuous(name="# Targets", range=c(3,10)) +
+                      labs(x="Mean score (kcal/mol)", y="Best score (kcal/mol)",
+                           title="Molecule bubble summary") +
+                      theme_classic()
+                  },
+                  rankline = {
+                    rk <- df %>% dplyr::arrange(.data[[score_col]]) %>%
+                      dplyr::mutate(rank=dplyr::row_number())
+                    ggplot(rk, aes(x=rank, y=.data[[score_col]])) +
+                      geom_line(colour="#2c7fb8", linewidth=0.9, alpha=alpha_v) +
+                      geom_point(aes(colour=.data[[tgt_col]]), alpha=alpha_v, size=1.3) +
+                      labs(x="Rank", y="Docking score (kcal/mol)", colour="Target",
+                           title="Rank-ordered score line") +
+                      theme_classic()
+                  },
+                  rug = {
+                    grp <- if (frac_col %in% names(df)) frac_col else tgt_col
+                    ggplot(df, aes(x=.data[[score_col]], colour=.data[[grp]])) +
+                      geom_density(linewidth=0.9, alpha=0.25) +
+                      geom_rug(alpha=alpha_v) +
+                      labs(x="Docking score (kcal/mol)", y="Density", colour=grp,
+                           title="Density plus rug score explorer") +
+                      theme_classic()
+                  }
+      )
+      apply_labels(p,"scoreex",input)
+    })
+  })
+  output$plot_scoreex <- renderPlot({
+    p<-make_scoreex_plot(); rv$plots[["scoreex"]]<-p; p })
+
+  # ════════════════════════════════════════════════════════
+  #  CLASSIFICATION
+  # ════════════════════════════════════════════════════════
+  make_classif_plot <- reactive({
+    req(input$draw_classif)
+    isolate({
+      nm <- input$sel_ds_classif; req(nm,rv$datasets[[nm]])
+      df <- rv$datasets[[nm]]
+      class_col <- get_col("classif_col_classification",df,c("pdb classification","classification"))
+      score_col <- get_col("classif_col_score",         df,c("docking score","score"))
+      frac_col  <- get_col("classif_col_fraction",      df,c("fractions","fraction"))
+      mol_col   <- get_col("classif_col_molecule",      df,c("title","molecule"))
+      df[[score_col]] <- suppressWarnings(as.numeric(df[[score_col]]))
+      if (!is.null(input$classif_filter_fraction) &&
+          length(input$classif_filter_fraction)>0 && frac_col %in% names(df))
+        df <- df[as.character(df[[frac_col]]) %in% input$classif_filter_fraction,]
+      if (input$classif_thresh < 0)
+        df <- df[!is.na(df[[score_col]]) & df[[score_col]] <= input$classif_thresh,]
+      req(nrow(df)>0, cancelOutput=TRUE)
+      pal   <- input$classif_palette %||% "Set2"
+      top_n <- input$classif_top_n
+      horiz <- input$classif_orient == "horiz"
+      alpha_v <- input$classif_alpha %||% 0.8
+
+      p <- switch(input$classif_type,
+                  count = {
+                    cd <- df %>% dplyr::count(.data[[class_col]],name="n") %>%
+                      dplyr::arrange(dplyr::desc(n)) %>% dplyr::slice_head(n=top_n) %>%
+                      dplyr::mutate(cls=forcats::fct_reorder(.data[[class_col]],n))
+                    if(horiz)
+                      ggplot(cd,aes(x=n,y=cls,fill=cls)) +
+                      geom_col(show.legend=FALSE, alpha=alpha_v) + scale_fill_brewer(palette=pal) +
+                      labs(x="Count",y="PDB Classification",title="Class count")
+                    else
+                      ggplot(cd,aes(x=cls,y=n,fill=cls)) +
+                      geom_col(show.legend=FALSE, alpha=alpha_v) + scale_fill_brewer(palette=pal) +
+                      labs(y="Count",x="") +
+                      theme(axis.text.x=element_text(angle=45,hjust=1))
+                  },
+                  meanscore = {
+                    ms <- df %>%
+                      dplyr::group_by(across(all_of(class_col))) %>%
+                      dplyr::summarise(mean_sc=mean(.data[[score_col]],na.rm=TRUE),
+                                       n=dplyr::n(),.groups="drop") %>%
+                      dplyr::arrange(mean_sc) %>% dplyr::slice_head(n=top_n) %>%
+                      dplyr::mutate(cls=forcats::fct_reorder(.data[[class_col]],mean_sc))
+                    if(horiz)
+                      ggplot(ms,aes(x=mean_sc,y=cls,fill=mean_sc)) +
+                      geom_col(show.legend=FALSE, alpha=alpha_v) +
+                      scale_fill_distiller(palette=pal,direction=-1) +
+                      labs(x="Mean score (kcal/mol)",y="PDB Classification",title="Mean score by class")
+                    else
+                      ggplot(ms,aes(x=cls,y=mean_sc,fill=mean_sc)) +
+                      geom_col(show.legend=FALSE, alpha=alpha_v) +
+                      scale_fill_distiller(palette=pal,direction=-1) +
+                      labs(y="Mean score",x="") +
+                      theme(axis.text.x=element_text(angle=45,hjust=1))
+                  },
+                  bestdot = {
+                    bd <- df %>%
+                      dplyr::group_by(across(all_of(class_col))) %>%
+                      dplyr::summarise(best=min(.data[[score_col]],na.rm=TRUE),
+                                       n=dplyr::n(),.groups="drop") %>%
+                      dplyr::arrange(best) %>% dplyr::slice_head(n=top_n) %>%
+                      dplyr::mutate(cls=forcats::fct_reorder(.data[[class_col]],best))
+                    ggplot(bd,aes(x=best,y=cls,colour=best,size=n)) +
+                      geom_point() +
+                      geom_vline(xintercept=-7,linetype="dashed",colour="red",alpha=0.5) +
+                      scale_colour_distiller(palette=pal,direction=-1,name="Best score") +
+                      scale_size_continuous(name="Count",range=c(2,10)) +
+                      labs(x="Best score (kcal/mol)",y="PDB Classification",
+                           title="Best score by class",caption="Red = -7 kcal/mol threshold")
+                  },
+                  stackbar = {
+                    req(frac_col %in% names(df))
+                    sb <- df %>%
+                      dplyr::count(.data[[class_col]],.data[[frac_col]],name="n") %>%
+                      dplyr::group_by(across(all_of(class_col))) %>%
+                      dplyr::mutate(total=sum(n)) %>% dplyr::ungroup() %>%
+                      dplyr::arrange(dplyr::desc(total)) %>%
+                      dplyr::filter(.data[[class_col]] %in%
+                                      unique(.data[[class_col]])[seq_len(top_n)]) %>%
+                      dplyr::mutate(cls=forcats::fct_reorder(.data[[class_col]],total))
+                    ggplot(sb,aes(x=n,y=cls,fill=.data[[frac_col]])) +
+                      geom_col(position="stack", alpha=alpha_v) +
+                      scale_fill_brewer(palette=pal,name="Fraction") +
+                      labs(x="Count",y="PDB Classification",title="Class count by fraction")
+                  },
+                  classheat = {
+                    tc <- df %>% dplyr::count(.data[[class_col]]) %>%
+                      dplyr::arrange(dplyr::desc(n)) %>%
+                      dplyr::slice_head(n=top_n) %>% dplyr::pull(1)
+                    tm <- df %>%
+                      dplyr::group_by(across(all_of(mol_col))) %>%
+                      dplyr::summarise(m=min(.data[[score_col]],na.rm=TRUE),.groups="drop") %>%
+                      dplyr::arrange(m) %>% dplyr::slice_head(n=30) %>% dplyr::pull(1)
+                    ch <- df %>%
+                      dplyr::filter(.data[[class_col]] %in% tc, .data[[mol_col]] %in% tm) %>%
+                      dplyr::group_by(across(all_of(c(mol_col,class_col)))) %>%
+                      dplyr::summarise(ms=mean(.data[[score_col]],na.rm=TRUE),.groups="drop")
+                    ggplot(ch,aes(x=.data[[mol_col]],y=.data[[class_col]],fill=ms)) +
+                      geom_tile(colour="white") +
+                       scale_fill_distiller(palette=pal,direction=-1,name="Mean score") +
+                       labs(x="Molecule",y="Classification",
+                            title="Mean score: top molecules x top classes") +
+                       theme(axis.text.x=element_text(angle=60,hjust=1,size=7))
+                  },
+                  violin = {
+                    vl <- df %>%
+                      dplyr::count(.data[[class_col]], name="n") %>%
+                      dplyr::arrange(dplyr::desc(n)) %>%
+                      dplyr::slice_head(n=top_n) %>%
+                      dplyr::pull(1)
+                    vdf <- df %>%
+                      dplyr::filter(.data[[class_col]] %in% vl) %>%
+                      dplyr::mutate(cls=forcats::fct_reorder(.data[[class_col]], .data[[score_col]], .fun=median))
+                    ggplot(vdf, aes(x=.data[[score_col]], y=cls, fill=cls)) +
+                      geom_violin(alpha=alpha_v, trim=FALSE, show.legend=FALSE) +
+                      geom_boxplot(width=0.12, fill="white", outlier.alpha=0.12) +
+                      scale_fill_brewer(palette=pal) +
+                      labs(x="Docking score (kcal/mol)", y="PDB Classification",
+                           title="Class-level score distribution") +
+                      theme_classic()
+                  },
+                  radialbar = {
+                    rb <- df %>% dplyr::count(.data[[class_col]], name="n") %>%
+                      dplyr::arrange(dplyr::desc(n)) %>% dplyr::slice_head(n=top_n) %>%
+                      dplyr::mutate(cls=wrap_text_vec(.data[[class_col]], 20))
+                    ggplot(rb, aes(x=factor(cls, levels=cls), y=n, fill=n)) +
+                      geom_col(alpha=alpha_v) +
+                      coord_polar() +
+                      scale_fill_distiller(palette=pal, direction=1, guide="none") +
+                      labs(x=NULL, y="Count", title="Radial class abundance plot") +
+                      theme_minimal()
+                  },
+                  medianbar = {
+                    md <- df %>% dplyr::group_by(across(all_of(class_col))) %>%
+                      dplyr::summarise(median_sc=median(.data[[score_col]], na.rm=TRUE),
+                                       n=dplyr::n(), .groups="drop") %>%
+                      dplyr::arrange(median_sc) %>% dplyr::slice_head(n=top_n) %>%
+                      dplyr::mutate(cls=forcats::fct_reorder(.data[[class_col]], median_sc))
+                    ggplot(md, aes(x=median_sc, y=cls, fill=n)) +
+                      geom_col(alpha=alpha_v) +
+                      scale_fill_distiller(palette=pal, direction=1, name="Count") +
+                      labs(x="Median score (kcal/mol)", y="PDB Classification",
+                           title="Median score by class") +
+                      theme_classic()
+                  },
+                  fracprop = {
+                    req(frac_col %in% names(df))
+                    fp_base <- df %>% dplyr::count(.data[[class_col]], .data[[frac_col]], name="n")
+                    top_cls <- fp_base %>%
+                      dplyr::group_by(across(all_of(class_col))) %>%
+                      dplyr::summarise(total=sum(n), .groups="drop") %>%
+                      dplyr::arrange(dplyr::desc(total)) %>%
+                      dplyr::slice_head(n=top_n)
+                    fp <- fp_base %>%
+                      dplyr::inner_join(top_cls, by=class_col) %>%
+                      dplyr::group_by(across(all_of(class_col))) %>%
+                      dplyr::mutate(prop=100 * n / total) %>%
+                      dplyr::ungroup() %>%
+                      dplyr::mutate(cls=forcats::fct_reorder(.data[[class_col]], total))
+                    ggplot(fp, aes(x=prop, y=cls, fill=.data[[frac_col]])) +
+                      geom_col(alpha=alpha_v) +
+                      scale_fill_brewer(palette=pal, name="Fraction") +
+                      labs(x="Within-class percentage", y="PDB Classification",
+                           title="Fractional composition within each class") +
+                      theme_classic()
+                  },
+                  activepct = {
+                    ap <- df %>% dplyr::group_by(across(all_of(class_col))) %>%
+                      dplyr::summarise(active_pct=100 * mean(.data[[score_col]] <= input$classif_thresh, na.rm=TRUE),
+                                       n=dplyr::n(), .groups="drop") %>%
+                      dplyr::arrange(dplyr::desc(active_pct)) %>% dplyr::slice_head(n=top_n) %>%
+                      dplyr::mutate(cls=forcats::fct_reorder(.data[[class_col]], active_pct))
+                    ggplot(ap, aes(x=active_pct, y=cls, fill=n)) +
+                      geom_col(alpha=alpha_v) +
+                      scale_fill_distiller(palette=pal, direction=1, name="Count") +
+                      labs(x="Active percentage", y="PDB Classification",
+                           title="Active docking percentage by class") +
+                      theme_classic()
+                  },
+                  classstrip = {
+                    top_cls <- df %>% dplyr::count(.data[[class_col]], name="n") %>%
+                      dplyr::arrange(dplyr::desc(n)) %>% dplyr::slice_head(n=top_n) %>% dplyr::pull(1)
+                    sd <- df %>% dplyr::filter(.data[[class_col]] %in% top_cls) %>%
+                      dplyr::mutate(cls=forcats::fct_reorder(.data[[class_col]], .data[[score_col]], .fun=median))
+                    ggplot(sd, aes(x=.data[[score_col]], y=cls, colour=.data[[frac_col]])) +
+                      geom_jitter(height=0.2, alpha=alpha_v, size=1.1) +
+                      labs(x="Docking score (kcal/mol)", y="PDB Classification", colour="Fraction",
+                           title="Class strip plot with per-entry scores") +
+                      theme_classic()
+                  },
+                  dotline = {
+                    dl <- df %>% dplyr::group_by(across(all_of(class_col))) %>%
+                      dplyr::summarise(best=min(.data[[score_col]], na.rm=TRUE),
+                                       mean_sc=mean(.data[[score_col]], na.rm=TRUE),
+                                       .groups="drop") %>%
+                      dplyr::arrange(best) %>% dplyr::slice_head(n=top_n) %>%
+                      dplyr::mutate(cls=forcats::fct_reorder(.data[[class_col]], best))
+                    ggplot(dl, aes(y=cls)) +
+                      geom_segment(aes(x=mean_sc, xend=best, yend=cls), colour="grey70", linewidth=1) +
+                      geom_point(aes(x=mean_sc), shape=21, fill="white", colour="black", size=2.5) +
+                      geom_point(aes(x=best, colour=best), size=3, alpha=alpha_v) +
+                      scale_colour_distiller(palette=pal, direction=-1, name="Best score") +
+                      labs(x="Docking score (kcal/mol)", y="PDB Classification",
+                           title="Dot-line class profile") +
+                      theme_classic()
+                  },
+                  moleculecount = {
+                    mc <- df %>% dplyr::group_by(across(all_of(class_col))) %>%
+                      dplyr::summarise(n_mol=dplyr::n_distinct(.data[[mol_col]]),
+                                       n=dplyr::n(), .groups="drop") %>%
+                      dplyr::arrange(dplyr::desc(n_mol)) %>% dplyr::slice_head(n=top_n) %>%
+                      dplyr::mutate(cls=forcats::fct_reorder(.data[[class_col]], n_mol))
+                    ggplot(mc, aes(x=n_mol, y=cls, fill=n)) +
+                      geom_col(alpha=alpha_v) +
+                      scale_fill_distiller(palette=pal, direction=1, name="Entries") +
+                      labs(x="Unique molecules", y="PDB Classification",
+                           title="Molecule diversity by class") +
+                      theme_classic()
+                  },
+                  fractionheat = {
+                    req(frac_col %in% names(df))
+                    fh <- df %>% dplyr::count(.data[[class_col]], .data[[frac_col]], name="n") %>%
+                      dplyr::group_by(across(all_of(class_col))) %>% dplyr::mutate(total=sum(n)) %>% dplyr::ungroup() %>%
+                      dplyr::arrange(dplyr::desc(total)) %>% dplyr::filter(.data[[class_col]] %in% unique(.data[[class_col]])[seq_len(top_n)])
+                    ggplot(fh, aes(x=.data[[frac_col]], y=.data[[class_col]], fill=n)) +
+                      geom_tile(colour="white", alpha=alpha_v) +
+                      scale_fill_distiller(palette=pal, direction=1, name="Count") +
+                      labs(x="Fraction", y="PDB Classification",
+                           title="Fraction-by-class heatmap") +
+                      theme_classic() +
+                      theme(axis.text.x=element_text(angle=30,hjust=1))
+                  }
+      )
+      apply_labels(p,"classif",input)
+    })
+  })
+  output$plot_classif <- renderPlot({
+    p<-make_classif_plot(); rv$plots[["classif"]]<-p; p })
+
+  # ── NETWORK ──────────────────────────────────────────────
+  make_net_plot <- reactive({
+    req(input$draw_net)
+    isolate({
+      nm <- input$sel_ds_net; req(nm,rv$datasets[[nm]])
+      df <- rv$datasets[[nm]]
+      h  <- get_col("net_col_herb",    df,c("fractions","fraction","herb"))
+      m  <- get_col("net_col_molecule",df,c("title","molecule","compound"))
+      tg <- get_col("net_col_target",  df,c("pdb id","pdb_id","target"))
+      nd <- df %>%
+        dplyr::rename(herb=all_of(h),molecule=all_of(m),target=all_of(tg)) %>%
+        dplyr::select(herb,molecule,target) %>% dplyr::distinct()
+      if (input$net_n>0 && nrow(nd)>input$net_n)
+        nd <- dplyr::sample_n(nd,input$net_n)
+      p <- TCMNP::tcm_net(nd, label.degree=input$net_label_deg,
+                          rem.dis.inter=input$net_rem_dis,
+                          graph.layout=input$net_layout)
+      apply_labels(p,"net",input,show_xy=FALSE)
+    })
+  })
+  output$plot_net <- renderPlot({ p<-make_net_plot(); rv$plots[["net"]]<-p; p })
+
+  # ── PPI ──────────────────────────────────────────────────
+  make_ppi_plot <- reactive({
+    req(input$draw_ppi)
+    isolate({
+      df <- get_mapped("ppi")
+      df <- apply_col_override(df,list(c("ppi_col_node1","node1"),
+                                       c("ppi_col_node2","node2"),
+                                       c("ppi_col_score","score")))
+      need_cols(df,c("node1","node2"))
+      p <- TCMNP::ppi_plot(df, node.color=input$ppi_color,
+                           graph.layout=input$ppi_layout,
+                           label.degree=input$ppi_label_deg,
+                           label.repel=input$ppi_repel,
+                           label.size=input$ppi_label_sz)
+      apply_labels(p,"ppi",input,show_xy=FALSE)
+    })
+  })
+  output$plot_ppi <- renderPlot({ p<-make_ppi_plot(); rv$plots[["ppi"]]<-p; p })
+
+  # ── SANKEY ───────────────────────────────────────────────
+  make_sankey_plot <- reactive({
+    req(input$draw_sankey)
+    isolate({
+      nm <- input$sel_ds_sankey; req(nm,rv$datasets[[nm]])
+      df <- rv$datasets[[nm]]
+      h  <- get_col("san_col_herb",       df,c("fractions","fraction","herb"))
+      m  <- get_col("san_col_molecule",   df,c("title","molecule"))
+      tg <- get_col("san_col_target",     df,c("pdb id","target"))
+      ds <- get_col("san_col_description",df,c("pdb classification","description"))
+      df2 <- df %>%
+        dplyr::rename(herb=all_of(h),molecule=all_of(m),
+                      target=all_of(tg),Description=all_of(ds)) %>%
+        dplyr::select(herb,molecule,target,Description) %>% dplyr::distinct()
+      n  <- input$sankey_n
+      sr <- function(d,n) if(n>0 && nrow(d)>n) d[sample(nrow(d),n),] else d
+      wrap_w <- input$sankey_wrap %||% 18
+      p  <- switch(input$sankey_type,
+                   sankey      = TCMNP::tcm_sankey(
+                     sr(dplyr::select(df2,herb,molecule,target),n),
+                     text.size=input$sankey_txt_sz,
+                     text.position=input$sankey_txt_pos),
+                   alluvial    = TCMNP::tcm_alluvial(
+                     sr(dplyr::select(df2,herb,molecule,target),n),
+                     text.size=input$sankey_txt_sz,
+                     text.position=input$sankey_txt_pos),
+                   sankey_dot  = TCMNP::tcm_sankey_dot(sr(df2,n)),
+                   alluvial_dot= TCMNP::tcm_alluvial_dot(sr(df2,n)),
+                   tf_cir      = {
+                     tf_df <- sr(df2, n) %>%
+                       dplyr::select(Description, target) %>%
+                       dplyr::distinct()
+                     names(tf_df) <- c("TF", "Target")
+                     TCMNP::tf_cirplot(tf_df)
+                   },
+                   dotsankey2  = TCMNP::dot_sankey2(sr(df2, n)),
+                   herbtargetbar = {
+                     hb <- sr(df2, n) %>%
+                       dplyr::count(herb, target, name="n") %>%
+                       dplyr::group_by(target) %>%
+                       dplyr::summarise(total=sum(n), .groups="drop") %>%
+                       dplyr::arrange(dplyr::desc(total)) %>%
+                       dplyr::slice_head(n=15) %>%
+                       dplyr::right_join(sr(df2, n) %>% dplyr::count(herb, target, name="n"), by="target") %>%
+                       dplyr::mutate(target=forcats::fct_reorder(wrap_text_vec(target, wrap_w), total))
+                     ggplot(hb, aes(x=n, y=target, fill=herb)) +
+                       geom_col(alpha=0.85) +
+                       labs(x="Links", y="Target", fill="Herb",
+                            title="Herb-to-target link distribution") +
+                       theme_classic()
+                   },
+                   moltargetheat = {
+                     ht <- sr(df2, n) %>%
+                       dplyr::count(molecule, target, name="n") %>%
+                       dplyr::group_by(target) %>% dplyr::mutate(t_total=sum(n)) %>% dplyr::ungroup()
+                     top_targets <- ht %>% dplyr::distinct(target, t_total) %>%
+                       dplyr::arrange(dplyr::desc(t_total)) %>% dplyr::slice_head(n=15) %>% dplyr::pull(target)
+                     top_mols <- ht %>% dplyr::count(molecule, wt=n, name="m_total") %>%
+                       dplyr::arrange(dplyr::desc(m_total)) %>% dplyr::slice_head(n=20) %>% dplyr::pull(molecule)
+                     ht <- ht %>% dplyr::filter(target %in% top_targets, molecule %in% top_mols)
+                     ggplot(ht, aes(x=wrap_text_vec(target, wrap_w), y=wrap_text_vec(molecule, wrap_w), fill=n)) +
+                       geom_tile(colour="white") +
+                       scale_fill_distiller(palette="YlOrRd", direction=1, name="Links") +
+                       labs(x="Target", y="Molecule", title="Molecule-target linkage heatmap") +
+                       theme_classic() +
+                       theme(axis.text.x=element_text(angle=45, hjust=1, size=8),
+                             axis.text.y=element_text(size=8))
+                   },
+                   herbclassalluvial = {
+                     ad <- sr(df2, n) %>%
+                       dplyr::mutate(Description=wrap_text_vec(Description, wrap_w)) %>%
+                       dplyr::count(herb, Description, target, name="Freq")
+                     ggplot(ad,
+                            aes(axis1=herb, axis2=Description, axis3=target, y=Freq)) +
+                       ggalluvial::geom_alluvium(aes(fill=Description), alpha=0.75, knot.pos=0.35) +
+                       ggalluvial::geom_stratum(width=0.25, fill="grey92", colour="grey50") +
+                       geom_text(stat="stratum", aes(label=after_stat(stratum)), size=3) +
+                       scale_x_discrete(limits=c("Herb","Class","Target"), expand=c(0.1, 0.1)) +
+                       labs(y="Links", title="Herb-class-target alluvial profile", fill="Class") +
+                       theme_minimal()
+                   },
+                   molclassalluvial = {
+                     ad <- sr(df2, n) %>%
+                       dplyr::mutate(Description=wrap_text_vec(Description, wrap_w),
+                                     molecule=wrap_text_vec(molecule, wrap_w)) %>%
+                       dplyr::count(molecule, Description, target, name="Freq")
+                     ggplot(ad,
+                            aes(axis1=molecule, axis2=Description, axis3=target, y=Freq)) +
+                       ggalluvial::geom_alluvium(aes(fill=Description), alpha=0.75, knot.pos=0.35) +
+                       ggalluvial::geom_stratum(width=0.25, fill="grey92", colour="grey50") +
+                       geom_text(stat="stratum", aes(label=after_stat(stratum)), size=2.8) +
+                       scale_x_discrete(limits=c("Molecule","Class","Target"), expand=c(0.1, 0.1)) +
+                       labs(y="Links", title="Molecule-class-target alluvial profile", fill="Class") +
+                       theme_minimal()
+                   }
+      )
+      apply_labels(p,"sankey",input,show_xy=FALSE)
+    })
+  })
+  output$plot_sankey <- renderPlot({
+    p<-make_sankey_plot(); rv$plots[["sankey"]]<-p; p })
+
+  # ── DEGREE ───────────────────────────────────────────────
+  make_degree_plot <- reactive({
+    req(input$draw_degree)
+    isolate({
+      nm <- input$sel_ds_degree; req(nm,rv$datasets[[nm]])
+      df <- rv$datasets[[nm]]
+      h  <- get_col("deg_col_herb",    df,c("fractions","fraction","herb"))
+      m  <- get_col("deg_col_molecule",df,c("title","molecule"))
+      tg <- get_col("deg_col_target",  df,c("pdb id","target"))
+      df2 <- df %>%
+        dplyr::rename(herb=all_of(h),molecule=all_of(m),target=all_of(tg)) %>%
+        dplyr::select(herb,molecule,target) %>% dplyr::distinct()
+      deg_df <- make_degree_df(df2) %>%
+        dplyr::group_by(type) %>%
+        dplyr::slice_max(order_by=degree, n=input$deg_top_n, with_ties=FALSE) %>%
+        dplyr::ungroup() %>%
+        dplyr::arrange(type, dplyr::desc(degree))
+      deg_df$id_wrap <- wrap_text_vec(deg_df$id, input$deg_text_w %||% 18)
+      deg_df$id_wrap <- factor(deg_df$id_wrap, levels=deg_df$id_wrap)
+      alp <- input$deg_alpha %||% 0.85
+      p <- switch(input$deg_type,
+                  degree_plot = TCMNP::degree_plot(df2, plot.set=input$deg_orient),
+                  radial = {
+                    ggplot(deg_df, aes(x=id_wrap, y=degree, fill=type)) +
+                      geom_col(alpha=alp) +
+                      coord_polar() +
+                      scale_fill_brewer(palette=input$deg_color %||% "Set2") +
+                      labs(x=NULL, y="Degree", title="Radial degree profile") +
+                      theme_minimal()
+                  },
+                  lollipop = {
+                    ggplot(deg_df, aes(x=degree, y=id_wrap, colour=type)) +
+                      geom_segment(aes(x=0, xend=degree, yend=id_wrap), linewidth=0.9, alpha=alp) +
+                      geom_point(size=3) +
+                      scale_colour_brewer(palette=input$deg_color %||% "Set2") +
+                      labs(x="Degree", y="Node", title="Lollipop degree plot") +
+                      theme_classic()
+                  },
+                  dot = {
+                    ggplot(deg_df, aes(x=degree, y=id_wrap, colour=type, size=degree)) +
+                      geom_point(alpha=alp) +
+                      scale_colour_brewer(palette=input$deg_color %||% "Set2") +
+                      labs(x="Degree", y="Node", title="Dot degree plot") +
+                      theme_classic()
+                  },
+                  area = {
+                    ad <- deg_df %>% dplyr::group_by(type) %>% dplyr::arrange(dplyr::desc(degree), .by_group=TRUE) %>%
+                      dplyr::mutate(rank=dplyr::row_number())
+                    ggplot(ad, aes(x=rank, y=degree, fill=type, colour=type)) +
+                      geom_area(alpha=0.25, position="identity") +
+                      geom_line(linewidth=0.9) +
+                      labs(x="Rank within node type", y="Degree", title="Area profile of node degree") +
+                      theme_classic()
+                  },
+                  cumulative = {
+                    cd <- deg_df %>% dplyr::group_by(type) %>% dplyr::arrange(dplyr::desc(degree), .by_group=TRUE) %>%
+                      dplyr::mutate(rank=dplyr::row_number(), cum_degree=cumsum(degree))
+                    ggplot(cd, aes(x=rank, y=cum_degree, colour=type)) +
+                      geom_line(linewidth=1) + geom_point(size=1.8) +
+                      labs(x="Rank", y="Cumulative degree", title="Cumulative degree accumulation") +
+                      theme_classic()
+                  },
+                  heatstrip = {
+                    hd <- deg_df %>% dplyr::group_by(type) %>% dplyr::arrange(dplyr::desc(degree), .by_group=TRUE) %>%
+                      dplyr::mutate(rank=dplyr::row_number())
+                    ggplot(hd, aes(x=rank, y=type, fill=degree)) +
+                      geom_tile(colour="white", alpha=alp) +
+                      scale_fill_distiller(palette="YlOrRd", direction=1, name="Degree") +
+                      labs(x="Rank", y="Node type", title="Degree heat strip") +
+                      theme_classic()
+                  },
+                  slope = {
+                    sd <- deg_df %>% dplyr::group_by(type) %>%
+                      dplyr::summarise(mean_degree=mean(degree), max_degree=max(degree), .groups="drop") %>%
+                      tidyr::pivot_longer(c(mean_degree, max_degree), names_to="metric", values_to="value")
+                    ggplot(sd, aes(x=metric, y=value, group=type, colour=type)) +
+                      geom_line(linewidth=1.1) + geom_point(size=3) +
+                      labs(x=NULL, y="Degree", title="Mean vs max degree slope by node type") +
+                      theme_classic()
+                  },
+                  pareto = {
+                    pd <- deg_df %>% dplyr::arrange(dplyr::desc(degree)) %>%
+                      dplyr::mutate(rank=dplyr::row_number(), cum_pct=100 * cumsum(degree) / sum(degree))
+                    ggplot(pd, aes(x=rank)) +
+                      geom_col(aes(y=degree, fill=type), alpha=alp) +
+                      geom_line(aes(y=max(degree) * cum_pct / 100), colour="black", linewidth=1) +
+                      labs(x="Node rank", y="Degree", fill="Type",
+                           title="Pareto chart of node degree") +
+                      theme_classic()
+                  },
+                  facetbar = {
+                    ggplot(deg_df, aes(x=id_wrap, y=degree, fill=type)) +
+                      geom_col(alpha=alp, show.legend=FALSE) +
+                      facet_wrap(~type, scales="free_y") +
+                      labs(x="Node", y="Degree", title="Facet degree bars by node type") +
+                      theme_classic() +
+                      theme(axis.text.x=element_text(angle=60, hjust=1, size=8))
+                  })
+      apply_labels(p,"degree",input)
+    })
+  })
+  output$plot_degree <- renderPlot({
+    p<-make_degree_plot(); rv$plots[["degree"]]<-p; p })
+
+  # ── VENN ─────────────────────────────────────────────────
+  make_venn_plot <- reactive({
+    req(input$draw_venn)
+    isolate({
+      nm <- input$sel_ds_venn; req(nm,rv$datasets[[nm]])
+      df <- rv$datasets[[nm]]
+      g  <- get_col("venn_col_gene",   df,c("pdb id","gene","target"))
+      d  <- get_col("venn_col_dataset",df,c("fractions","fraction","dataset"))
+      df2 <- df %>%
+        dplyr::rename(gene=all_of(g),dataset=all_of(d)) %>%
+        dplyr::select(gene,dataset) %>% dplyr::distinct()
+      alp <- input$venn_alpha %||% 0.85
+      overlap_df <- pairwise_overlap_df(df2)
+      if (isTRUE(input$venn_normalize) && nrow(overlap_df)) {
+        set_sizes <- df2 %>% dplyr::count(dataset, name="size")
+        overlap_df <- overlap_df %>%
+          dplyr::left_join(set_sizes, by=c("set1"="dataset")) %>%
+          dplyr::rename(size1=size) %>%
+          dplyr::left_join(set_sizes, by=c("set2"="dataset")) %>%
+          dplyr::rename(size2=size) %>%
+          dplyr::mutate(overlap=ifelse(size1 + size2 - overlap > 0, overlap / (size1 + size2 - overlap), 0))
+      }
+      p <- switch(input$venn_type,
+                  v1 = TCMNP::venn_plot(df2, type=1),
+                  v2 = TCMNP::venn_plot(df2, type=2),
+                  vnet = {
+                    tg <- names(sort(table(df2$gene),decreasing=TRUE))[
+                      seq_len(min(input$venn_net_top,nrow(df2)))]
+                    TCMNP::venn_net(
+                      rbind(dplyr::sample_n(df2,min(100,nrow(df2))),
+                            df2[df2$gene %in% tg,]),
+                      label.degree=input$venn_label_deg)
+                  },
+                  upset = {
+                    combo <- df2 %>%
+                      dplyr::group_by(gene) %>%
+                      dplyr::summarise(combo=paste(sort(unique(dataset)), collapse=" & "),
+                                       n_sets=dplyr::n_distinct(dataset),
+                                       .groups="drop") %>%
+                      dplyr::count(combo, n_sets, name="genes") %>%
+                      dplyr::arrange(dplyr::desc(genes), dplyr::desc(n_sets)) %>%
+                      dplyr::slice_head(n=input$venn_net_top) %>%
+                      dplyr::mutate(combo=forcats::fct_reorder(combo, genes))
+                    ggplot(combo, aes(x=genes, y=combo, fill=n_sets)) +
+                      geom_col(alpha=alp) +
+                      scale_fill_distiller(palette="Blues", direction=1, name="# Sets") +
+                      labs(x="Genes in intersection", y="Combination",
+                           title="UpSet-style combination frequencies") +
+                      theme_classic()
+                  },
+                  datasetbar = {
+                    dsz <- df2 %>% dplyr::count(dataset, name="n") %>%
+                      dplyr::arrange(dplyr::desc(n)) %>%
+                      dplyr::mutate(dataset=forcats::fct_reorder(dataset, n))
+                    ggplot(dsz, aes(x=n, y=dataset, fill=n)) +
+                      geom_col(alpha=alp) +
+                      scale_fill_distiller(palette="Blues", direction=1, guide="none") +
+                      labs(x="Unique genes", y="Dataset", title="Dataset size bar plot") +
+                      theme_classic()
+                  },
+                  overlapheat = {
+                    ggplot(overlap_df, aes(x=set1, y=set2, fill=overlap)) +
+                      geom_tile(colour="white", alpha=alp) +
+                      scale_fill_distiller(palette="Blues", direction=1,
+                                           name=if (isTRUE(input$venn_normalize)) "Jaccard" else "Overlap") +
+                      labs(x="Dataset", y="Dataset", title="Pairwise overlap heatmap") +
+                      theme_classic() +
+                      theme(axis.text.x=element_text(angle=45, hjust=1))
+                  },
+                  membership = {
+                    mem <- df2 %>% dplyr::count(gene, name="n_sets") %>%
+                      dplyr::count(n_sets, name="genes")
+                    ggplot(mem, aes(x=n_sets, y=genes, fill=genes)) +
+                      geom_col(alpha=alp) +
+                      scale_fill_distiller(palette="Purples", direction=1, guide="none") +
+                      labs(x="# Datasets containing gene", y="# Genes",
+                           title="Membership size distribution") +
+                      theme_classic()
+                  },
+                  genefreq = {
+                    mem <- df2 %>% dplyr::count(gene, name="n_sets")
+                    ggplot(mem, aes(x=n_sets)) +
+                      geom_histogram(binwidth=1, boundary=0.5, fill="#4c78a8", colour="white", alpha=alp) +
+                      labs(x="# Datasets containing gene", y="Frequency",
+                           title="Gene frequency histogram across datasets") +
+                      theme_classic()
+                  },
+                  pairbar = {
+                    pb <- overlap_df %>% dplyr::filter(set1 != set2) %>%
+                      dplyr::mutate(pair=paste(set1, set2, sep=" vs ")) %>%
+                      dplyr::arrange(dplyr::desc(overlap)) %>%
+                      dplyr::slice_head(n=input$venn_net_top) %>%
+                      dplyr::mutate(pair=forcats::fct_reorder(pair, overlap))
+                    ggplot(pb, aes(x=overlap, y=pair, fill=overlap)) +
+                      geom_col(alpha=alp) +
+                      scale_fill_distiller(palette="Blues", direction=1, guide="none") +
+                      labs(x=if (isTRUE(input$venn_normalize)) "Jaccard index" else "Overlap size",
+                           y="Dataset pair", title="Top pairwise overlaps") +
+                      theme_classic()
+                  },
+                  datasetheat = {
+                    top_genes <- df2 %>% dplyr::count(gene, name="n") %>%
+                      dplyr::arrange(dplyr::desc(n)) %>% dplyr::slice_head(n=input$venn_net_top) %>% dplyr::pull(gene)
+                    hd <- df2 %>% dplyr::filter(gene %in% top_genes) %>%
+                      dplyr::mutate(val=1)
+                    ggplot(hd, aes(x=dataset, y=wrap_text_vec(gene, 20), fill=val)) +
+                      geom_tile(colour="white", alpha=alp) +
+                      scale_fill_distiller(palette="Greens", direction=1, guide="none") +
+                      labs(x="Dataset", y="Gene", title="Dataset-gene membership heatmap") +
+                      theme_classic() +
+                      theme(axis.text.x=element_text(angle=45, hjust=1), axis.text.y=element_text(size=8))
+                  })
+      apply_labels(p,"venn",input,show_xy=FALSE)
+    })
+  })
+  output$plot_venn <- renderPlot({ p<-make_venn_plot(); rv$plots[["venn"]]<-p; p })
+
+  # ── ENRICHMENT ───────────────────────────────────────────
+  make_enrich_plot <- reactive({
+    req(input$draw_enrich)
+    isolate({
+      df <- get_mapped("enrich")
+      df <- apply_col_override(df,list(
+        c("enr_col_desc","Description"),c("enr_col_count","Count"),
+        c("enr_col_pvalue","pvalue"),   c("enr_col_generatio","GeneRatio"),
+        c("enr_col_bgratio","BgRatio"), c("enr_col_geneid","geneID")))
+      df <- normalise_enrich_df(df)
+      if("pvalue" %in% names(df))
+        df <- df %>% dplyr::arrange(pvalue) %>%
+        dplyr::slice_head(n=input$enrich_top_n)
+      ttl <- input$enrich_title %||% "Enrichment"
+      alp <- input$enrich_alpha %||% 0.85
+      wrap_w <- input$enrich_wrap %||% 28
+      df$Description_wrapped <- wrap_text_vec(df$Description, wrap_w)
+      p <- switch(input$enrich_type,
+                  bar        = TCMNP::bar_plot(df,title=ttl),
+                  dot        = TCMNP::dot_plot(df,title=ttl),
+                  lollipop   = TCMNP::lollipop_plot(df,title=ttl),
+                  cir        = TCMNP::cir_plot(df),
+                  bubble     = TCMNP::bubble_plot(df),
+                  gobar      = TCMNP::go_barplot(df),
+                  godot      = TCMNP::go_dotplot(df),
+                  golollipop = TCMNP::go_lollipop(df),
+                  gocir      = TCMNP::go_cir(df),
+                  cirplot    = TCMNP::cir_plot(df),
+                  gocirdiff  = TCMNP::go_cir(df),
+                  tfcir      = {
+                    tf_df <- explode_links(df$Description, df$geneID)
+                    req(nrow(tf_df) > 0, cancelOutput=TRUE)
+                    TCMNP::tf_cirplot(tf_df)
+                  },
+                  pathcir    = TCMNP::pathway_cirplot(df),
+                  pathcc     = TCMNP::pathway_ccplot(df,root=ttl),
+                  richheat   = {
+                    heat_df <- df %>%
+                      dplyr::transmute(
+                        Description=Description_wrapped,
+                        Count=Count,
+                        RichFactor=RichFactor,
+                        `-log10(p)`=neglog10p
+                      ) %>%
+                      tidyr::pivot_longer(-Description, names_to="metric", values_to="value") %>%
+                      dplyr::group_by(metric) %>%
+                      dplyr::mutate(value_scaled=(value - min(value, na.rm=TRUE)) /
+                                      ifelse(diff(range(value, na.rm=TRUE)) == 0, 1,
+                                             diff(range(value, na.rm=TRUE)))) %>%
+                      dplyr::ungroup()
+                    ggplot(heat_df, aes(x=metric, y=forcats::fct_rev(Description), fill=value_scaled)) +
+                      geom_tile(colour="white", linewidth=0.3) +
+                      scale_fill_distiller(palette=input$enrich_color %||% "Spectral",
+                                           direction=1, name="Scaled\nvalue") +
+                      labs(x=NULL, y="Enrichment term",
+                           title="Enrichment metric heatmap",
+                           subtitle="Scaled comparison across count, rich factor, and significance") +
+                      theme_classic() +
+                      theme(axis.text.x=element_text(face="bold"),
+                            axis.text.y=element_text(size=8))
+                  },
+                  countp     = {
+                    lab_df <- df %>% dplyr::slice_head(n=min(8, nrow(df)))
+                    ggplot(df, aes(x=Count, y=RichFactor, size=gene_ratio_num, colour=neglog10p)) +
+                      geom_point(alpha=alp) +
+                      geom_text(data=lab_df, aes(label=Description_wrapped), hjust=-0.05, vjust=0.5,
+                                size=3, inherit.aes=FALSE, x=lab_df$Count, y=lab_df$RichFactor) +
+                      scale_colour_distiller(palette=input$enrich_color %||% "Spectral",
+                                             direction=1, name="-log10(p)") +
+                      scale_size_continuous(name="Gene hits", range=c(3, 10)) +
+                      scale_x_continuous(expand=expansion(mult=c(0.02, 0.2))) +
+                      labs(x="Count", y="Rich factor",
+                           title="Count versus enrichment strength",
+                           subtitle="Larger points indicate more genes associated with the term") +
+                      theme_classic()
+                  },
+                  genelink   = {
+                    link_df <- explode_links(df$Description_wrapped, df$geneID) %>%
+                      dplyr::count(term, name="gene_links") %>%
+                      dplyr::arrange(dplyr::desc(gene_links)) %>%
+                      dplyr::slice_head(n=min(15, nrow(.))) %>%
+                      dplyr::mutate(term=forcats::fct_reorder(term, gene_links))
+                    ggplot(link_df, aes(x=gene_links, y=term, fill=gene_links)) +
+                      geom_col(alpha=alp) +
+                      scale_fill_distiller(palette=input$enrich_color %||% "Spectral",
+                                           direction=1, guide="none") +
+                      labs(x="Linked genes", y="Enrichment term",
+                           title="Gene-link burden by enrichment term",
+                           subtitle="Useful for spotting broad multi-gene pathways") +
+                      theme_classic()
+                  },
+                  dotsan     = TCMNP::dot_sankey(df),
+                  radialbar  = {
+                    rd <- df %>% dplyr::arrange(pvalue) %>%
+                      dplyr::mutate(term=factor(Description_wrapped, levels=Description_wrapped))
+                    ggplot(rd, aes(x=term, y=Count, fill=neglog10p)) +
+                      geom_col(alpha=alp) +
+                      coord_polar() +
+                      scale_fill_distiller(palette=input$enrich_color %||% "Spectral", direction=1, name="-log10(p)") +
+                      labs(x=NULL, y="Count", title="Radial bar enrichment view") +
+                      theme_minimal()
+                  },
+                  richbar = {
+                    rb <- df %>% dplyr::arrange(RichFactor) %>%
+                      dplyr::mutate(term=forcats::fct_reorder(Description_wrapped, RichFactor))
+                    ggplot(rb, aes(x=RichFactor, y=term, fill=Count)) +
+                      geom_col(alpha=alp) +
+                      scale_fill_distiller(palette=input$enrich_color %||% "Spectral", direction=1, name="Count") +
+                      labs(x="Rich factor", y="Term", title="Rich-factor ranking bar plot") +
+                      theme_classic()
+                  },
+                  pbar = {
+                    pb <- df %>% dplyr::arrange(pvalue) %>%
+                      dplyr::mutate(term=forcats::fct_reorder(Description_wrapped, neglog10p))
+                    ggplot(pb, aes(x=neglog10p, y=term, fill=neglog10p)) +
+                      geom_col(alpha=alp) +
+                      scale_fill_distiller(palette=input$enrich_color %||% "Spectral", direction=1, guide="none") +
+                      labs(x="-log10(p)", y="Term", title="Significance-ranked enrichment bar") +
+                      theme_classic()
+                  },
+                  ontbar = {
+                    od <- df %>% dplyr::count(ONTOLOGY, name="n")
+                    ggplot(od, aes(x=ONTOLOGY, y=n, fill=ONTOLOGY)) +
+                      geom_col(alpha=alp, show.legend=FALSE) +
+                      scale_fill_brewer(palette="Set2") +
+                      labs(x="Ontology", y="Term count", title="Ontology term counts") +
+                      theme_classic()
+                  },
+                  ontdot = {
+                    od <- df %>% dplyr::group_by(ONTOLOGY) %>%
+                      dplyr::summarise(mean_count=mean(Count, na.rm=TRUE),
+                                       mean_rich=mean(RichFactor, na.rm=TRUE),
+                                       n=dplyr::n(), .groups="drop")
+                    ggplot(od, aes(x=mean_count, y=mean_rich, size=n, colour=ONTOLOGY)) +
+                      geom_point(alpha=alp) +
+                      labs(x="Mean count", y="Mean rich factor", size="Terms",
+                           title="Ontology dot summary") +
+                      theme_classic()
+                  },
+                  termtile = {
+                    td <- df %>% dplyr::transmute(
+                      term=Description_wrapped,
+                      Count=Count,
+                      RichFactor=RichFactor,
+                      Significance=neglog10p
+                    ) %>% tidyr::pivot_longer(-term, names_to="metric", values_to="value")
+                    ggplot(td, aes(x=metric, y=forcats::fct_rev(term), fill=value)) +
+                      geom_tile(colour="white", alpha=alp) +
+                      scale_fill_distiller(palette=input$enrich_color %||% "Spectral", direction=1, name="Value") +
+                      labs(x=NULL, y="Term", title="Term metric tile view") +
+                      theme_classic() +
+                      theme(axis.text.y=element_text(size=8))
+                  },
+                  termscatter = {
+                    ggplot(df, aes(x=Count, y=neglog10p, size=RichFactor, colour=ONTOLOGY)) +
+                      geom_point(alpha=alp) +
+                      labs(x="Count", y="-log10(p)", size="Rich factor", colour="Ontology",
+                           title="Enrichment term scatter") +
+                      theme_classic()
+                  },
+                  phist = {
+                    ggplot(df, aes(x=pvalue)) +
+                      geom_histogram(bins=20, fill="#8c6bb1", colour="white", alpha=alp) +
+                      labs(x="p-value", y="Terms", title="P-value histogram") +
+                      theme_classic()
+                  },
+                  counthist = {
+                    ggplot(df, aes(x=Count)) +
+                      geom_histogram(bins=20, fill="#41ab5d", colour="white", alpha=alp) +
+                      labs(x="Count", y="Terms", title="Gene count histogram") +
+                      theme_classic()
+                  },
+                  linkheat = {
+                    link_df <- explode_links(df$Description_wrapped, df$geneID)
+                    top_genes <- link_df %>% dplyr::count(gene, name="n") %>%
+                      dplyr::arrange(dplyr::desc(n)) %>% dplyr::slice_head(n=20) %>% dplyr::pull(gene)
+                    top_terms <- df$Description_wrapped[seq_len(min(15, nrow(df)))]
+                    hd <- link_df %>% dplyr::filter(gene %in% top_genes, term %in% top_terms) %>%
+                      dplyr::mutate(val=1)
+                    ggplot(hd, aes(x=gene, y=term, fill=val)) +
+                      geom_tile(colour="white", alpha=alp) +
+                      scale_fill_distiller(palette="YlOrRd", direction=1, guide="none") +
+                      labs(x="Gene", y="Term", title="Gene-link heatmap") +
+                      theme_classic() +
+                      theme(axis.text.x=element_text(angle=60, hjust=1, size=8),
+                            axis.text.y=element_text(size=8))
+                  },
+                  polarbubble = {
+                    pd <- df %>% dplyr::mutate(term=factor(Description_wrapped, levels=Description_wrapped),
+                                               idx=dplyr::row_number())
+                    ggplot(pd, aes(x=idx, y=Count, size=RichFactor, colour=neglog10p)) +
+                      geom_point(alpha=alp) +
+                      coord_polar() +
+                      scale_colour_distiller(palette=input$enrich_color %||% "Spectral", direction=1, name="-log10(p)") +
+                      labs(x=NULL, y="Count", size="Rich factor", title="Polar bubble enrichment view") +
+                      theme_minimal()
+                  },
+                  waterfall = {
+                    wf <- df %>% dplyr::arrange(neglog10p) %>%
+                      dplyr::mutate(delta=c(neglog10p[1], diff(neglog10p)),
+                                    term=forcats::fct_reorder(Description_wrapped, neglog10p))
+                    ggplot(wf, aes(x=term, y=delta, fill=delta > 0)) +
+                      geom_col(alpha=alp, show.legend=FALSE) +
+                      coord_flip() +
+                      labs(x="Term", y="Increment in -log10(p)", title="Waterfall of enrichment significance") +
+                      theme_classic()
+                  },
+                  rankline = {
+                    rk <- df %>% dplyr::arrange(pvalue) %>% dplyr::mutate(rank=dplyr::row_number())
+                    ggplot(rk, aes(x=rank, y=neglog10p, colour=ONTOLOGY)) +
+                      geom_line(linewidth=0.9) +
+                      geom_point(aes(size=Count), alpha=alp) +
+                      labs(x="Rank", y="-log10(p)", size="Count", colour="Ontology",
+                           title="Ranked enrichment line profile") +
+                      theme_classic()
+                  },
+                  ontstack = {
+                    st <- df %>% dplyr::group_by(ONTOLOGY) %>%
+                      dplyr::summarise(total_count=sum(Count, na.rm=TRUE),
+                                       total_rich=sum(RichFactor, na.rm=TRUE), .groups="drop") %>%
+                      tidyr::pivot_longer(c(total_count, total_rich), names_to="metric", values_to="value")
+                    ggplot(st, aes(x=ONTOLOGY, y=value, fill=metric)) +
+                      geom_col(position="stack", alpha=alp) +
+                      labs(x="Ontology", y="Aggregated value", fill="Metric",
+                           title="Ontology stacked metric totals") +
+                      theme_classic()
+                  }
+      )
+      apply_labels(p,"enrich",input)
+    })
+  })
+  output$plot_enrich <- renderPlot({
+    p<-make_enrich_plot(); rv$plots[["enrich"]]<-p; p })
+
+  # ── EXPORT ───────────────────────────────────────────────
+  output$do_export <- downloadHandler(
+    filename=function()
+      paste0("TCMNP_",input$exp_which,"_",
+             format(Sys.time(),"%Y%m%d_%H%M%S"),".",input$exp_fmt),
+    content=function(file) {
+      p <- rv$plots[[input$exp_which]]
+      validate(need(!is.null(p),"Draw the plot first."))
+      w<-input$exp_w; h<-input$exp_h; dpi<-input$exp_dpi
+      switch(input$exp_fmt,
+             png ={ grDevices::png( file,width=w,height=h,units="in",res=dpi)
+               print(p); grDevices::dev.off() },
+             pdf ={ grDevices::pdf( file,width=w,height=h)
+               print(p); grDevices::dev.off() },
+             svg ={ grDevices::svg( file,width=w,height=h)
+               print(p); grDevices::dev.off() },
+             tiff={ grDevices::tiff(file,width=w,height=h,units="in",
+                                    res=dpi,compression="lzw")
+               print(p); grDevices::dev.off() }
+      )
+    }
+  )
+}
+
+shinyApp(ui, server)
