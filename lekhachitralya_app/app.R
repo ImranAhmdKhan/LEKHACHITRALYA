@@ -24,7 +24,7 @@
 #    R/mod_venn.R          – Venn / UpSet module    (gene-set data, 10 plots)
 #    R/mod_enrich.R        – Enrichment module      (enrichment data, 30+ plots)
 #    R/mod_gallery.R          – Plot Gallery / Classification (505+ plot types)
-#    R/mod_general.R          – General Purpose Plots (82 implemented types)
+#    R/mod_general.R          – General Purpose Plots (86 implemented types)
 #    www/custom.css        – CSS overrides
 #
 #  All shared reactive state (datasets, mappings, plots, global

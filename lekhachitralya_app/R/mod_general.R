@@ -12,13 +12,13 @@
 #  Required    : At minimum one column for X
 #  Optional    : Y, Color/Group, Size, Label columns
 #
-#  Plot groups (82 types)
+#  Plot groups (86 types)
 #  ─────────────────────
 #  A. Bar & Column        (15 types)
 #  B. Histogram & Density (10 types)
 #  C. Box & Violin        ( 8 types)
-#  D. Scatter & Bubble    (11 types)
-#  E. Line & Area         (10 types)
+#  D. Scatter & Bubble    (13 types)
+#  E. Line & Area         (12 types)
 #  F. Heatmap & Tile      ( 6 types)
 #  G. Part-to-Whole       ( 7 types)
 #  H. Ranking & Comparison( 5 types)
