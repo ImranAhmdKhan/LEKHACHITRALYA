@@ -1,0 +1,87 @@
+/* ============================================================
+   custom.css – LekhaChitralya Shiny App
+   Custom styles for dashboard layout, badges and overrides.
+   ============================================================ */
+
+/* ── Body / Box ─────────────────────────────────────────── */
+body { background-color: #f4f6f9; font-family: "Open Sans", sans-serif; }
+
+.box { border-radius: 6px; }
+
+.content-wrapper, .right-side { background: #f4f6f9; }
+
+/* ── Sidebar ─────────────────────────────────────────────── */
+.skin-green .main-sidebar { background-color: #1a2a3a; }
+.skin-green .sidebar-menu > li.active > a,
+.skin-green .sidebar-menu > li:hover > a {
+  border-left: 4px solid #00c770;
+  background: #233546;
+}
+
+/* ── Input group labels ──────────────────────────────────── */
+.override-group h6, .filter-group h6, .map-group h5 {
+  color: #555;
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  margin: 6px 0 4px 0;
+}
+
+/* ── Auto-detect badge ───────────────────────────────────── */
+.auto-badge {
+  background: #00c770;
+  color: #fff;
+  border-radius: 3px;
+  padding: 1px 5px;
+  font-size: 10px;
+  margin-left: 4px;
+}
+
+/* ── Dataset badge ───────────────────────────────────────── */
+.dataset-badge {
+  background: #2c5282;
+  color: #fff;
+  border-radius: 3px;
+  padding: 2px 7px;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+/* ── Best-plot badge ─────────────────────────────────────── */
+.best-badge {
+  background: #c0392b;
+  color: #fff;
+  border-radius: 3px;
+  padding: 1px 4px;
+  font-size: 10px;
+}
+
+/* ── Value box fix ───────────────────────────────────────── */
+.small-box h3 { font-size: 28px; }
+.small-box .icon { font-size: 60px; top: 10px; }
+
+/* ── Spinner override ────────────────────────────────────── */
+.shiny-spinner-output-container > .spinner-overlay {
+  background: rgba(255, 255, 255, 0.75) !important;
+}
+
+/* ── Section dividers ────────────────────────────────────── */
+.map-group {
+  border: 1px dashed #ddd;
+  padding: 8px 10px;
+  border-radius: 4px;
+  margin-bottom: 10px;
+  background: #f9fbfd;
+}
+
+/* ── Plot caption ────────────────────────────────────────── */
+.plot-caption {
+  font-size: 11px;
+  color: #888;
+  margin-top: 4px;
+  text-align: right;
+}
+
+/* ── Action button polish ────────────────────────────────── */
+.btn-lg { border-radius: 4px; font-weight: 600; }
