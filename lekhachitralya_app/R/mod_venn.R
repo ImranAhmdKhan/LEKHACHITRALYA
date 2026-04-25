@@ -52,7 +52,7 @@ vennUI <- function() {
             "Membership distribution" = "membership",
             "Gene frequency histogram"= "genefreq",
             "Top pairwise overlap bar"= "pairbar",
-            "Dataset\u00d7gene heatmap" = "datasetheat"),
+            "Dataset \u00d7 gene heatmap" = "datasetheat"),
           selected = "v1"),
         numericInput("venn_net_top",  "Top N for network / UpSet", 30, 5, 200),
         numericInput("venn_label_deg","Label degree threshold",     2,  1, 20),

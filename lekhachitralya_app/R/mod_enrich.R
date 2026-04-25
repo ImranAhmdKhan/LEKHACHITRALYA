@@ -74,6 +74,7 @@ enrichUI <- function() {
             "TCMNP GO \u2013 dot"      = "godot",
             "TCMNP GO \u2013 lollipop" = "golollipop",
             "TCMNP GO \u2013 circular" = "gocir",
+            "TCMNP GO circular (diff)" = "gocirdiff",
             "TCMNP pathway circle"     = "pathcir",
             "TCMNP pathway CC"         = "pathcc",
             "TCMNP TF circular"        = "tfcir",
